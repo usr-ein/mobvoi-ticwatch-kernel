@@ -1,0 +1,14 @@
+# /etc/systemd/system/kernel-trial-wifi.service  (systemctl enable kernel-trial-wifi)
+[Unit]
+Description=Reconnect the saved Wi-Fi network if a trial kernel boots without it
+ConditionKernelCommandLine=sonic.trial=1
+After=connman.service
+[Service]
+# connman doesn't retry a failed first association (BUILD.md, Gotchas), and a
+# trial that can't be reached can't be confirmed. From 20 s after the start,
+# for 2 minutes: while connman is neither ready nor online, scan, then connect
+# the saved network (the first service `connmanctl services` marks `*A`:
+# saved, autoconnect). Changes no setting and reads no credentials.
+ExecStart=/bin/sh -c "sleep 20; n=0; while [ $$n -lt 8 ]; do connmanctl state | grep -q -E 'State = (ready|online)' && exit 0; connmanctl scan wifi; for s in $$(connmanctl services | awk '/^[*]A/ {print $$NF; exit}'); do connmanctl connect $$s; done; sleep 15; n=$$((n + 1)); done"
+[Install]
+WantedBy=multi-user.target

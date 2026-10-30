@@ -25,7 +25,8 @@ Read these before touching the watch.
   watch falls back to. `flash-recovery.sh` refuses to run if `boot` does not
   hold it.
 - **Allowed writes on the watch:** the `recovery` partition,
-  `/etc/systemd/system/kernel-trial.service` and its enable symlink,
+  `/etc/systemd/system/kernel-trial.service` and
+  `/etc/systemd/system/kernel-trial-wifi.service` with their enable symlinks,
   `/run/sonic-trial-ok`, temporary files in `/tmp`. Nothing else.
 - **Every trial image carries `sonic.trial=1 msm_poweroff.download_mode=0`.**
   The first arms the dead-man's switch; the second makes a panic reboot (after
@@ -67,7 +68,7 @@ Read these before touching the watch.
 |---|---|
 | Trial kernel panics or oopses | reboots after 5 s into the normal kernel on `boot` |
 | Boots, but you don't confirm within 10 min | dead-man's switch reboots into `boot` |
-| Boots but SSH/Wi-Fi is dead | wait 10 min; meanwhile `adb shell` works over the USB cable if it's plugged in. If Wi-Fi failed to connect at boot, connman can be told to reconnect (see Gotchas) |
+| Boots but SSH/Wi-Fi is dead | wait 10 min; meanwhile `adb shell` works over the USB cable if it's plugged in. If Wi-Fi failed to connect at boot, `kernel-trial-wifi.service` (below) retries for 2 min; connman can also be told to reconnect by hand (see Gotchas) |
 | Hangs before userspace, no panic | needs the user: hold the **top** button ~8 s (PMIC reset), the watch boots `boot` |
 
 The persistent journal keeps the failed boot: `journalctl --list-boots`, then
@@ -104,6 +105,39 @@ Check it is still there: `ssh sonic-screwdriver systemctl is-enabled kernel-tria
 ```sh
 ssh sonic-screwdriver 'cat > /etc/systemd/system/kernel-trial.service && systemctl daemon-reload && systemctl enable kernel-trial' < "$T/sonic/kernel-trial.service"
 ```
+
+The Wi-Fi retry, installed on 2026-10-30 (identical to
+`sonic/kernel-trial-wifi.service`). connman doesn't retry a failed first
+association (see Gotchas), and a trial that can't be reached can't be
+confirmed either, so the dead-man's switch takes it back. Like the switch, it
+runs only on trial boots:
+
+```
+# /etc/systemd/system/kernel-trial-wifi.service  (systemctl enable kernel-trial-wifi)
+[Unit]
+Description=Reconnect the saved Wi-Fi network if a trial kernel boots without it
+ConditionKernelCommandLine=sonic.trial=1
+After=connman.service
+[Service]
+# connman doesn't retry a failed first association (BUILD.md, Gotchas), and a
+# trial that can't be reached can't be confirmed. From 20 s after the start,
+# for 2 minutes: while connman is neither ready nor online, scan, then connect
+# the saved network (the first service `connmanctl services` marks `*A`:
+# saved, autoconnect). Changes no setting and reads no credentials.
+ExecStart=/bin/sh -c "sleep 20; n=0; while [ $$n -lt 8 ]; do connmanctl state | grep -q -E 'State = (ready|online)' && exit 0; connmanctl scan wifi; for s in $$(connmanctl services | awk '/^[*]A/ {print $$NF; exit}'); do connmanctl connect $$s; done; sleep 15; n=$$((n + 1)); done"
+[Install]
+WantedBy=multi-user.target
+```
+
+Install it, check it (must print `enabled`), and undo it:
+
+```sh
+ssh sonic-screwdriver 'cat > /etc/systemd/system/kernel-trial-wifi.service && systemctl daemon-reload && systemctl enable kernel-trial-wifi' < "$T/sonic/kernel-trial-wifi.service"
+ssh sonic-screwdriver systemctl is-enabled kernel-trial-wifi
+ssh sonic-screwdriver 'systemctl disable kernel-trial-wifi && rm /etc/systemd/system/kernel-trial-wifi.service && systemctl daemon-reload'
+```
+
+`journalctl -b -u kernel-trial-wifi` shows what it did on a trial boot.
 
 ## One-time setup
 
@@ -234,6 +268,26 @@ compares the build with the 2.1 release boot image:
 To re-run it on a build directory `$B`:
 `python3 -I "$T/sonic/verify.py" ~/Downloads/asteroidos-rubyfish-2.1/asteroid-rubyfish-boot.img "$B"`
 (add `--allow-config-diff` for config-changing branches).
+
+### Kernels with the stock module ABI (`sound` and later)
+
+The `sound` branch turns tracing and module signatures back on as in the
+stock Wear OS kernel, so that Mobvoi's audio modules on the vendor partition
+(`/vendor/lib/modules/audio_*.ko`) load. That changes `struct module` and
+`struct task_struct`, so check 6 reports about 6,000 CRC changes against the
+2.1 release, by design, and the release's three rootfs modules no longer load
+(nothing loads them). The ABI that matters is now the stock modules'. Check
+it with `modcrc.py` before every trial of such a kernel; it exits non-zero on
+any mismatch:
+
+```sh
+M=~/Documents/sonic-screwdriver/build/kernel/vendor-modules   # git-ignored; never commit these
+[ -d "$M" ] || { mkdir -p "$M" && scp -q 'sonic-screwdriver:/vendor/lib/modules/*.ko' "$M/"; }
+python3 -I "$T/sonic/modcrc.py" "$B" "$M"
+```
+
+It must say 493 match, 0 mismatch, 0 missing (395 symbols resolved between
+the modules). The 2.1 release gives 148 match, 343 mismatch, 2 missing.
 
 ## Trial boot
 
@@ -373,6 +427,16 @@ a fresh normal boot, and a control boot of the release kernel from
   and lacks the USB ones (`android_work`, `msm_hsusb`, `configfs-gadget`,
   `ipa_get_transport_type … IPA HW is not supported`). Seen with
   `brightness-fix` on 2026-10-30.
+- **Kernels with the stock module ABI** (`sound` and later) add, at every
+  boot: the `trace_printk() being used. Allocating extra memory.` NOTICE
+  banner (Qualcomm's `msm_bus_fabric_adhoc.c` uses `trace_printk()`, as in
+  stock; the trace buffer then takes 1.4 MB per CPU), `Loaded X.509 cert
+  'Build time autogenerated kernel key: …'` (the build's throwaway module
+  signing key), and systemd mounting the kernel trace file system instead of
+  skipping it. Seen with `sound` on 2026-10-30.
+- **Kernels with the speaker cap** (`sound`, from build 020) add, at every
+  boot: `i2c-speaker-cap: speaker amplifier 2-0034 held at least 20.0 dB below
+  full gain` (22.0 in builds 020 and 021). Seen with `sound` on 2026-10-30.
 
 ## Gotchas
 
@@ -392,7 +456,8 @@ a fresh normal boot, and a control boot of the release kernel from
   services` still shows the saved network without `R`/`O`, connect it:
   `connmanctl connect $(connmanctl services | awk '/^\*A/ {print $NF; exit}')`.
   Same address, nothing in the settings changes. Keep the watch in range while
-  it boots. Seen twice on 2026-10-30.
+  it boots. Seen three times on 2026-10-30. On trial boots,
+  `kernel-trial-wifi.service` does both by itself for 2 minutes.
 - **An unconfirmed trial whose Wi-Fi is down** can still be confirmed over adb
   before the dead-man's switch fires: check it by hand (`uname -v`, `dmesg` for
   oops, the touch driver bound, the launcher active), then
@@ -437,11 +502,13 @@ a fresh normal boot, and a control boot of the release kernel from
 | `build-kernel.sh` | container | the build itself (called by `kbuild.sh`) |
 | `kshell.sh` | Mac | shell or command in the container's source tree |
 | `verify.py` | either | equivalence checks against the release |
+| `modcrc.py` | either | would given modules (the stock audio ones) pass MODVERSIONS on a build? |
 | `bootimg.py` | either | inspect, split, pack and compare boot images |
 | `flash-recovery.sh` | Mac | write a trial image to `recovery` over SSH, with safety checks |
 | `trial-check.sh` | Mac | health check of the running kernel over SSH; `--confirm` |
 | `klog-compare.py` | Mac | diff two kernel logs |
 | `kernel-trial.service` | watch | the dead-man's switch |
+| `kernel-trial-wifi.service` | watch | reconnects the saved Wi-Fi network if a trial boots without it |
 
 | Variable | Default |
 |---|---|
