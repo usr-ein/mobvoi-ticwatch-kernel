@@ -59,15 +59,15 @@ Read these before touching the watch.
 2. `systemctl reboot --reboot-argument=recovery` boots `recovery` once. The
    bootloader goes back to `boot` on the next reboot by itself.
 3. `kernel-trial.service` (the dead-man's switch, below) starts only when the
-   cmdline has `sonic.trial=1`. It waits 10 minutes, then reboots unless
-   `/run/sonic-trial-ok` exists. `trial-check.sh --confirm` creates that file
-   once the trial looks healthy.
+   cmdline has `sonic.trial=1`. It waits until the watch has been up for 10
+   minutes, suspend included, then reboots unless `/run/sonic-trial-ok` exists.
+   `trial-check.sh --confirm` creates that file once the trial looks healthy.
 
 | What goes wrong | What happens |
 |---|---|
 | Trial kernel panics or oopses | reboots after 5 s into the normal kernel on `boot` |
 | Boots, but you don't confirm within 10 min | dead-man's switch reboots into `boot` |
-| Boots but SSH/Wi-Fi is dead | wait 10 min; meanwhile `adb shell` works over the USB cable if it's plugged in |
+| Boots but SSH/Wi-Fi is dead | wait 10 min; meanwhile `adb shell` works over the USB cable if it's plugged in. If Wi-Fi failed to connect at boot, connman can be told to reconnect (see Gotchas) |
 | Hangs before userspace, no panic | needs the user: hold the **top** button ~8 s (PMIC reset), the watch boots `boot` |
 
 The persistent journal keeps the failed boot: `journalctl --list-boots`, then
@@ -83,10 +83,20 @@ The dead-man's switch, installed on the watch on 2026-10-30 (identical to
 Description=Return to the normal kernel unless this trial kernel is confirmed
 ConditionKernelCommandLine=sonic.trial=1
 [Service]
-ExecStart=/bin/sh -c 'sleep 600; [ -e /run/sonic-trial-ok ] || systemctl reboot'
+# Wait for 600 s of boot time, suspend included (/proc/uptime): a plain
+# `sleep 600` counts only the time the watch is awake, so off the cable it
+# can take far longer. The check runs at the first wakeup past 600 s.
+ExecStart=/bin/sh -c 'while [ "$$(cut -d. -f1 /proc/uptime)" -lt 600 ]; do sleep 5; done; [ -e /run/sonic-trial-ok ] || systemctl reboot'
 [Install]
 WantedBy=multi-user.target
 ```
+
+It counts boot time because `sleep` doesn't count suspend: the first
+version, `sleep 600`, fired after exactly 600 s on the cable, where the watch
+never suspends, but an unconfirmed trial off the cable was still running 13
+minutes after boot (2026-10-30). The check itself still needs the watch to be
+awake; it wakes every few seconds to minutes on its own (Wi-Fi, timers).
+`$$` is how a unit file passes a literal `$` to the shell.
 
 Check it is still there: `ssh sonic-screwdriver systemctl is-enabled kernel-trial`
 (must print `enabled`). To reinstall:
@@ -368,6 +378,25 @@ a fresh normal boot, and a control boot of the release kernel from
 
 - `systemctl reboot recovery` fails on the watch's systemd 257 ("Too many
   arguments."); use `systemctl reboot --reboot-argument=recovery`.
+- **A boot that starts on the USB cable never suspends, not even after
+  unplugging.** mce starts a CPU keepalive when it sees the charger at boot
+  and doesn't stop it (`journalctl -u mce`: "keepalive started", no "stopped
+  after"), so its `mce_mux` wakelock stays held. Off the cable at boot, the
+  same keepalive stops after 13 s. A test that needs real system suspends must
+  boot off the cable: unplug first, then reboot over Wi-Fi.
+- **connman doesn't retry a failed Wi-Fi connection at boot.** If the first
+  association fails (out of range, or the access point rejects the WPA
+  handshake; `journalctl -u connman`: `error "connect-failed"`, then `state is
+  failure`), wlan0 stays down and SSH is gone for the whole boot. Over adb,
+  `connmanctl scan wifi` sometimes makes connman reconnect; if `connmanctl
+  services` still shows the saved network without `R`/`O`, connect it:
+  `connmanctl connect $(connmanctl services | awk '/^\*A/ {print $NF; exit}')`.
+  Same address, nothing in the settings changes. Keep the watch in range while
+  it boots. Seen twice on 2026-10-30.
+- **An unconfirmed trial whose Wi-Fi is down** can still be confirmed over adb
+  before the dead-man's switch fires: check it by hand (`uname -v`, `dmesg` for
+  oops, the touch driver bound, the launcher active), then
+  `adb shell touch /run/sonic-trial-ok`.
 - The journal is persistent but keeps only about 10 hours: the kernel logs
   every suspend/resume (`gic_show_resume_irq`, …) and journald vacuums old
   entries at ~480 MB. The boot-time messages of a long-running boot are gone;

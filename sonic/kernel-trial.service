@@ -3,6 +3,9 @@
 Description=Return to the normal kernel unless this trial kernel is confirmed
 ConditionKernelCommandLine=sonic.trial=1
 [Service]
-ExecStart=/bin/sh -c 'sleep 600; [ -e /run/sonic-trial-ok ] || systemctl reboot'
+# Wait for 600 s of boot time, suspend included (/proc/uptime): a plain
+# `sleep 600` counts only the time the watch is awake, so off the cable it
+# can take far longer. The check runs at the first wakeup past 600 s.
+ExecStart=/bin/sh -c 'while [ "$$(cut -d. -f1 /proc/uptime)" -lt 600 ]; do sleep 5; done; [ -e /run/sonic-trial-ok ] || systemctl reboot'
 [Install]
 WantedBy=multi-user.target
