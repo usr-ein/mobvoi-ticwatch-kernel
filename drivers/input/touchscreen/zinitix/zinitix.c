@@ -2538,7 +2538,7 @@ static int bt541_ts_resume(struct device *dev)
 		zinitix_err("Failed to send power sequence(program start)\n");
 	msleep(50);
 
-	if (mini_init_touch(info) != I2C_SUCCESS) {
+	if (!mini_init_touch(info)) {
 		zinitix_err("resume_reset: zinitix_resume_proc err\n");
 		goto reset_exit;
 	}
