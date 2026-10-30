@@ -38,6 +38,7 @@
 #include <linux/of_irq.h>
 #include <linux/io.h>
 #include <linux/power_supply.h>
+#include <linux/suspend.h>
 
 #include <linux/kernel.h>
 #include <linux/hrtimer.h>
@@ -517,6 +518,7 @@ struct bt541_ts_info {
 #ifdef SEC_FACTORY_TEST
 	struct tsp_factory_info *factory_info;
 	struct tsp_raw_data *raw_data;
+	struct device *factory_dev;
 #endif
 	struct regulator *vdd;
 	struct regulator *vcc_i2c;
@@ -525,6 +527,24 @@ struct bt541_ts_info {
 	bool device_enabled;
 	bool checkUMSmode;
 	bool enable_wakeup;
+	/* suspend cut the chip's power (enable_wakeup was 0 then) */
+	bool switched_off;
+
+	/* recovery of a chip that stopped answering; under work_lock */
+	struct delayed_work recovery_work;
+	unsigned long recovered_at;
+	unsigned int recovery_attempt;
+	bool recovery_pending;
+	bool irq_off_for_recovery;
+
+	/*
+	 * System sleep: from our .suspend to our .resume the I2C controller
+	 * may be suspended, so the IRQ thread leaves the chip alone and
+	 * .resume handles the interrupt it deferred.
+	 */
+	spinlock_t pm_lock;
+	bool pm_suspended;
+	bool irq_deferred;
 };
 
 #ifdef CONFIG_HAS_EARLYSUSPEND
@@ -2158,8 +2178,196 @@ static void clear_report_data(struct bt541_ts_info *info)
 	info->finger_cnt1 = 0;
 }
 
+/*
+ * Recovery of a controller that stopped answering. A reset alone is not
+ * enough once the firmware is stuck, so this power-cycles the chip with
+ * GPIO 46, which switches its supply (on rover both regulators are
+ * dummies), then resets it, runs the vendor power sequence and writes
+ * the registers, as resume does. A chip that stays dead is retried less
+ * and less often rather than given up on, and so is one that fails
+ * again soon after a recovery. The helpers below run with work_lock
+ * held.
+ */
+static const unsigned int bt541_recovery_delay_ms[] = {
+	0, 100, 1000, 5000, 30000,
+};
+
+/* a recovery older than this doesn't slow down the next one */
+#define BT541_RECOVERY_FORGET		(60 * HZ)
+/* how long the chip stays switched off */
+#define BT541_RECOVERY_OFF_MS		200
+
+static bool bt541_reinit_chip(struct bt541_ts_info *info)
+{
+	struct bt541_ts_platform_data *pdata = info->pdata;
+	struct i2c_client *client = info->client;
+	u16 fw_version;
+
+	/* off, held in reset so that it isn't fed through that pin */
+	if (gpio_is_valid(pdata->gpio_reset))
+		gpio_direction_output(pdata->gpio_reset, 0);
+	if (gpio_is_valid(pdata->gpio_switch))
+		gpio_direction_output(pdata->gpio_switch, 0);
+	bt541_power_control(info, POWER_OFF);
+	msleep(BT541_RECOVERY_OFF_MS - CHIP_OFF_DELAY);
+
+	if (gpio_is_valid(pdata->gpio_switch))
+		gpio_direction_output(pdata->gpio_switch, 1);
+	if (!bt541_power_control(info, POWER_ON_SEQUENCE))
+		return false;
+
+	if (!mini_init_touch(info))
+		return false;
+
+#if USE_WAKEUP_GESTURE
+	/* as init_touch() does: no stale gesture after the power-up */
+	if (write_reg(client, 0x126, 0) != I2C_SUCCESS)
+		return false;
+#endif
+
+	/* acknowledged writes don't prove the firmware runs: read it back */
+	if (read_data(client, BT541_FIRMWARE_VERSION,
+		      (u8 *)&fw_version, 2) < 0 ||
+	    fw_version != info->cap_info.fw_version) {
+		zinitix_err("no firmware answer after power-up\n");
+		return false;
+	}
+
+	/* with the display off, the chip waits in idle mode for a tap */
+	if (info->work_state == SUSPEND &&
+	    (write_cmd(client, BT541_CLEAR_INT_STATUS_CMD) != I2C_SUCCESS ||
+	     write_cmd(client, BT541_IDLE_CMD) != I2C_SUCCESS))
+		return false;
+
+	return true;
+}
+
+static void bt541_queue_recovery(struct bt541_ts_info *info,
+				 unsigned int delay)
+{
+	/* stay awake for the quick attempts; later ones wait for a wakeup */
+	if (delay <= 5000)
+		pm_wakeup_event(&info->client->dev, delay + 1000);
+
+	/* freezable: never runs while the system suspends or resumes */
+	mod_delayed_work(system_freezable_wq, &info->recovery_work,
+			 msecs_to_jiffies(delay));
+}
+
+static void bt541_queue_next_recovery(struct bt541_ts_info *info)
+{
+	unsigned int i = min_t(unsigned int, info->recovery_attempt,
+			       ARRAY_SIZE(bt541_recovery_delay_ms) - 1);
+
+	bt541_queue_recovery(info, bt541_recovery_delay_ms[i]);
+}
+
+static void bt541_schedule_recovery(struct bt541_ts_info *info,
+				    const char *reason)
+{
+	if (info->recovery_pending)
+		return;
+
+	zinitix_err("%s, recovering the controller\n", reason);
+	info->recovery_pending = true;
+	if (time_after(jiffies, info->recovered_at + BT541_RECOVERY_FORGET))
+		info->recovery_attempt = 0;
+	if (!info->irq_off_for_recovery) {
+		disable_irq_nosync(info->irq);
+		info->irq_off_for_recovery = true;
+	}
+	/* fingers that are down will never see their release */
+	clear_report_data(info);
+	bt541_queue_next_recovery(info);
+}
+
+static void bt541_recovery_done(struct bt541_ts_info *info)
+{
+	info->recovery_pending = false;
+	info->recovered_at = jiffies;
+	/* if it is still waiting, the work finds nothing to do */
+	cancel_delayed_work(&info->recovery_work);
+	if (info->irq_off_for_recovery) {
+		info->irq_off_for_recovery = false;
+		enable_irq(info->irq);
+	}
+}
+
+/*
+ * The chip holds its interrupt line low until its status is cleared,
+ * and the interrupt is edge-triggered: a clear that fails silences
+ * touch for good. Retry once, then recover.
+ */
+static bool bt541_clear_int(struct bt541_ts_info *info)
+{
+	if (write_cmd(info->client, BT541_CLEAR_INT_STATUS_CMD) ==
+	    I2C_SUCCESS ||
+	    write_cmd(info->client, BT541_CLEAR_INT_STATUS_CMD) ==
+	    I2C_SUCCESS)
+		return true;
+
+	bt541_schedule_recovery(info, "clearing the interrupt failed twice");
+	return false;
+}
+
+static void bt541_recovery_work(struct work_struct *work)
+{
+	struct bt541_ts_info *info = container_of(to_delayed_work(work),
+					struct bt541_ts_info, recovery_work);
+
+	down(&info->work_lock);
+	if (!info->recovery_pending ||
+	    (info->work_state != NOTHING && info->work_state != SUSPEND))
+		goto out;
+
+	if (info->work_state == SUSPEND && info->switched_off) {
+		/* off on purpose: the display resume powers it up again */
+		bt541_recovery_done(info);
+		goto out;
+	}
+
+	info->recovery_attempt++;
+	if (bt541_reinit_chip(info)) {
+		zinitix_info("controller recovered, attempt %u\n",
+			     info->recovery_attempt);
+		bt541_recovery_done(info);
+	} else {
+		zinitix_err("recovery attempt %u failed\n",
+			    info->recovery_attempt);
+		bt541_queue_next_recovery(info);
+	}
+out:
+	up(&info->work_lock);
+}
+
 #define	PALM_REPORT_WIDTH	200
 #define	PALM_REJECT_WIDTH	255
+
+/*
+ * Called first by the IRQ thread. Between our .suspend and .resume the
+ * I2C controller may already be suspended, or have its interrupt
+ * disabled by suspend_device_irqs(), and every transfer would time out:
+ * the chip would look dead. So leave the event in the chip until its
+ * interrupt status is cleared, abort the system suspend as an armed
+ * wakeup interrupt does, and let .resume handle the interrupt.
+ */
+static bool bt541_defer_irq(struct bt541_ts_info *info)
+{
+	bool defer;
+
+	spin_lock(&info->pm_lock);
+	defer = info->pm_suspended;
+	if (defer)
+		info->irq_deferred = true;
+	spin_unlock(&info->pm_lock);
+
+	if (defer) {
+		pm_wakeup_event(&info->client->dev, 500);
+		pm_system_wakeup();
+	}
+
+	return defer;
+}
 
 static irqreturn_t bt541_touch_work(int irq, void *data)
 {
@@ -2185,6 +2393,9 @@ static irqreturn_t bt541_touch_work(int irq, void *data)
 	zinitix_debug("%s:%d touch_info.status 0x%x\n", __func__, __LINE__,
 		      info->touch_info.status);
 
+	if (bt541_defer_irq(info))
+		return IRQ_HANDLED;
+
 	if (down_trylock(&info->work_lock)) {
 		zinitix_err("Failed to occupy work lock\n");
 		write_cmd(client, BT541_CLEAR_INT_STATUS_CMD);
@@ -2195,7 +2406,7 @@ static irqreturn_t bt541_touch_work(int irq, void *data)
 	if (info->palm_detected_flag) {
 		cur_time = ktime_get_boottime();
 		if (cur_time.tv64 - info->last_plam_time.tv64 < 600000000) {
-			write_cmd(client, BT541_CLEAR_INT_STATUS_CMD);
+			bt541_clear_int(info);
 			zinitix_debug("palm_detected_flag debounce return\n");
 			goto out;
 		}
@@ -2207,9 +2418,11 @@ static irqreturn_t bt541_touch_work(int irq, void *data)
 #if USE_WAKEUP_GESTURE
 	if ((tpd_halt) && (info->work_state == SUSPEND)) {
 		zinitix_debug(" gesture wakeup ");
-		if (read_data(client, 0x126, (u8 *)&gesture_flag, 2) < 0) {
+		if (read_data(client, 0x126, (u8 *)&gesture_flag, 2) < 0 &&
+		    read_data(client, 0x126, (u8 *)&gesture_flag, 2) < 0) {
 			zinitix_err(" gesture read reg error!\n");
-			ret = 0;
+			bt541_schedule_recovery(info, "gesture read failed twice");
+			goto out;
 		} else {
 			/* wake up */
 			zinitix_debug(" gesture_flag: %d\n", gesture_flag);
@@ -2237,7 +2450,7 @@ static irqreturn_t bt541_touch_work(int irq, void *data)
 		}
 
 		zinitix_debug("wake up----\n");
-		write_cmd(client, BT541_CLEAR_INT_STATUS_CMD);
+		bt541_clear_int(info);
 		goto out;
 	}
 #endif
@@ -2253,13 +2466,15 @@ static irqreturn_t bt541_touch_work(int irq, void *data)
 
 	if (ts_read_coord(info) == false) {
 		zinitix_err("couldn't read touch_dev coord. read fail\n");
-		bt541_power_control(info, POWER_ON_SEQUENCE);
-		mini_init_touch(info);
-		goto out;
+		/* one failed read can be a glitch, two in a row are not */
+		if (ts_read_coord(info) == false) {
+			bt541_schedule_recovery(info, "touch read failed twice");
+			goto out;
+		}
 	}
 
-	if (write_cmd(client, BT541_CLEAR_INT_STATUS_CMD) != 0)
-		zinitix_err("BT541_CLEAR_INT_STATUS_CMD error 11\n");
+	if (!bt541_clear_int(info))
+		goto out;
 
 	/* invalid : maybe periodical repeated int. */
 	if (info->touch_info.status == 0x0) {
@@ -2471,6 +2686,7 @@ static int bt541_ts_resume(struct device *dev)
 	struct i2c_client *client = to_i2c_client(dev);
 	struct bt541_ts_info *info = i2c_get_clientdata(client);
 	struct bt541_ts_platform_data *pdata = info->pdata;
+	bool ok = true;
 
 	zinitix_debug("resume start\n");
 
@@ -2488,28 +2704,23 @@ static int bt541_ts_resume(struct device *dev)
 		return 0;
 	}
 	info->work_state = RESUME;
+	disable_irq(info->irq);
 
-	if (!info->enable_wakeup) {
-		if (pdata->gpio_switch > 0) {
-			err = gpio_direction_output(pdata->gpio_switch, 1);
-			if (err) {
-				zinitix_err("unable to set switch gpio %d\n",
-						pdata->gpio_switch);
-				return -EIO;
-			}
-			bt541_power_control(info, POWER_ON_SEQUENCE);
-
-			info->touch_mode = TOUCH_POINT_MODE;
-			init_touch(info);
-			goto reset_exit;
-		} else {
-			zinitix_info("gpio switch is not valid %d\n",
+	/* follow what suspend did, not what enable_wakeup says now */
+	if (info->switched_off) {
+		info->switched_off = false;
+		err = gpio_direction_output(pdata->gpio_switch, 1);
+		if (err)
+			zinitix_err("unable to set switch gpio %d\n",
 					pdata->gpio_switch);
-		}
+		bt541_power_control(info, POWER_ON_SEQUENCE);
+
+		info->touch_mode = TOUCH_POINT_MODE;
+		ok = init_touch(info);
+		goto reset_exit;
 	}
 
 	/***********Link modify here on 2020/7/23 ***************/
-	disable_irq(info->irq);
 
 	//resume reset init
 	if (gpio_is_valid(pdata->gpio_reset)) {
@@ -2522,24 +2733,33 @@ static int bt541_ts_resume(struct device *dev)
 	}
 
 	//power sequence process
-	if (write_reg(client, 0xc000, 0x0001) != I2C_SUCCESS)
+	if (write_reg(client, 0xc000, 0x0001) != I2C_SUCCESS) {
 		zinitix_err("Failed to send power sequence(vendor cmd enable)\n");
+		ok = false;
+	}
 	udelay(1000);
 
-	if (write_cmd(client, 0xc004) != I2C_SUCCESS)
+	if (write_cmd(client, 0xc004) != I2C_SUCCESS) {
 		zinitix_err("Failed to send power sequence(intn clear)\n");
+		ok = false;
+	}
 	udelay(1000);
 
-	if (write_reg(client, 0xc002, 0x0001) != I2C_SUCCESS)
+	if (write_reg(client, 0xc002, 0x0001) != I2C_SUCCESS) {
 		zinitix_err("Failed to send power sequence(nvm init)\n");
+		ok = false;
+	}
 	udelay(1000);
 
-	if (write_reg(client, 0xc001, 0x0001) != I2C_SUCCESS)
+	if (write_reg(client, 0xc001, 0x0001) != I2C_SUCCESS) {
 		zinitix_err("Failed to send power sequence(program start)\n");
+		ok = false;
+	}
 	msleep(50);
 
-	if (mini_init_touch(info) != I2C_SUCCESS) {
+	if (!mini_init_touch(info)) {
 		zinitix_err("resume_reset: zinitix_resume_proc err\n");
+		ok = false;
 		goto reset_exit;
 	}
 	/***********End of moidfy ***************/
@@ -2553,6 +2773,11 @@ reset_exit:
 	info->work_state = NOTHING;
 
 	enable_irq(info->irq);
+
+	if (!ok)
+		bt541_schedule_recovery(info, "resume failed");
+	else if (info->recovery_pending)
+		bt541_recovery_done(info);
 
 	tpd_halt = 0;
 	up(&info->work_lock);
@@ -2631,7 +2856,8 @@ static int bt541_ts_suspend(struct device *dev)
 			if (err) {
 				zinitix_err("unable to clear switch gpio %d\n",
 						pdata->gpio_switch);
-				return -EIO;
+			} else {
+				info->switched_off = true;
 			}
 		} else {
 			zinitix_info("gpio switch is not valid %d\n",
@@ -2660,6 +2886,8 @@ static int fb_notifier_callback(struct notifier_block *self,
 			schedule_work(&misc_touch_dev->resume_work);
 		} else if (*blank == FB_BLANK_POWERDOWN ||
 				*blank == FB_BLANK_NORMAL) {
+			/* a resume still queued would undo this suspend */
+			flush_work(&misc_touch_dev->resume_work);
 			bt541_ts_suspend(&misc_touch_dev->client->dev);
 		}
 	}
@@ -3867,9 +4095,15 @@ static int init_sec_factory(struct bt541_ts_info *info)
 		list_add_tail(&tsp_cmds[i].list, &factory_info->cmd_list_head);
 
 	sec_class = class_create(THIS_MODULE, "tsp");
+	if (IS_ERR(sec_class)) {
+		zinitix_err("Failed to create class tsp\n");
+		ret = PTR_ERR(sec_class);
+		sec_class = NULL;
+		goto err_create_device;
+	}
 
 	factory_ts_dev = device_create(sec_class, NULL, 0, info, "tsp");
-	if (unlikely(!factory_ts_dev)) {
+	if (IS_ERR_OR_NULL(factory_ts_dev)) {
 		zinitix_err("Failed to create factory dev\n");
 		ret = -ENODEV;
 		goto err_create_device;
@@ -3909,17 +4143,39 @@ static int init_sec_factory(struct bt541_ts_info *info)
 
 	info->factory_info = factory_info;
 	info->raw_data = raw_data;
+	info->factory_dev = factory_ts_dev;
 
 	return ret;
 
 err_create_sysfs:
+	sysfs_remove_link(&factory_ts_dev->kobj, "input");
+	device_unregister(factory_ts_dev);
 err_create_device:
+	if (sec_class)
+		class_destroy(sec_class);
+	sec_class = NULL;
 	kfree(raw_data);
 err_alloc2:
 	kfree(factory_info);
 err_alloc1:
 
 	return ret;
+}
+
+static void remove_sec_factory(struct bt541_ts_info *info)
+{
+	if (!info->factory_dev)
+		return;
+
+	sysfs_remove_group(&info->factory_dev->kobj, &touchscreen_attr_group);
+	sysfs_remove_link(&info->factory_dev->kobj, "input");
+	device_unregister(info->factory_dev);
+	class_destroy(sec_class);
+	sec_class = NULL;
+	info->factory_dev = NULL;
+
+	kfree(info->factory_info);
+	kfree(info->raw_data);
 }
 #endif /* SEC_FACTORY_TEST */
 
@@ -4636,14 +4892,14 @@ static int bt541_ts_probe(struct i2c_client *client,
 		if (ret) {
 			zinitix_err("unable to set direction for gpio %d\n",
 				pdata->gpio_switch);
-			goto err_no_platform_data;
+			goto err_free_switch;
 		}
 	}
 
 	if (!i2c_check_functionality(adapter, I2C_FUNC_I2C)) {
 		zinitix_err("Not compatible i2c function\n");
 		ret = -EIO;
-		goto err_no_platform_data;
+		goto err_free_switch;
 	}
 
 	info = kzalloc(sizeof(struct bt541_ts_info), GFP_KERNEL);
@@ -4656,6 +4912,12 @@ static int bt541_ts_probe(struct i2c_client *client,
 	info->client = client;
 	info->pdata = pdata;
 	info->device_enabled = 1;
+	spin_lock_init(&info->pm_lock);
+	INIT_DELAYED_WORK(&info->recovery_work, bt541_recovery_work);
+	info->recovered_at = jiffies;
+#if defined(CONFIG_FB)
+	INIT_WORK(&info->resume_work, ts_resume_work);
+#endif
 	misc_touch_dev = info;
 
 	ret = zinitix_ts_pinctrl_init(info);
@@ -4826,6 +5088,9 @@ static int bt541_ts_probe(struct i2c_client *client,
 
 	pdata->tsp_irq = info->irq;
 
+	/* the wakeup source bt541_defer_irq() reports to */
+	device_init_wakeup(&client->dev, true);
+
 	ret = request_threaded_irq(info->irq, NULL, bt541_touch_work,
 				   IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
 				   BT541_TS_DEVICE, info);
@@ -4841,8 +5106,6 @@ static int bt541_ts_probe(struct i2c_client *client,
 	ret = fb_register_client(&info->fb_notif);
 	if (ret)
 		zinitix_err("Unable to register fb_notifier: %d\n", ret);
-
-	INIT_WORK(&info->resume_work, ts_resume_work);
 #elif defined(CONFIG_HAS_EARLYSUSPEND)
 	info->early_suspend.level = EARLY_SUSPEND_LEVEL_BLANK_SCREEN + 1;
 	info->early_suspend.suspend = zinitix_early_suspend;
@@ -4878,18 +5141,27 @@ static int bt541_ts_probe(struct i2c_client *client,
 
 #ifdef SEC_FACTORY_TEST
 err_kthread_create_failed:
-	kfree(info->factory_info);
-	kfree(info->raw_data);
+	misc_deregister(&touch_misc_device);
 #endif
 err_misc_register:
+	/* the IRQ thread and the works leave the chip alone from here */
+	down(&info->work_lock);
+	info->work_state = REMOVE;
+	up(&info->work_lock);
+#if defined(CONFIG_FB)
+	fb_unregister_client(&info->fb_notif);
+	cancel_work_sync(&info->resume_work);
+#endif
+	cancel_delayed_work_sync(&info->recovery_work);
 	free_irq(info->irq, info);
 err_irq_of_parse:
 err_request_irq:
 #if ESD_TIMER_INTERVAL
 err_input_register_device2:
-
-	input_unregister_device(info->input_dev);
 #endif
+	/* registered: unregistering frees it, input_free_device() must not */
+	input_unregister_device(info->input_dev);
+	info->input_dev = NULL;
 err_touch_init:
 	bt541_power_control(info, POWER_OFF);
 err_power_sequence:
@@ -4911,15 +5183,19 @@ err_gpio_request:
 		if (IS_ERR_OR_NULL(info->pinctrl_state_release)) {
 			devm_pinctrl_put(info->ts_pinctrl);
 			info->ts_pinctrl = NULL;
-		} else {
-			ret = pinctrl_select_state(info->ts_pinctrl,
-						   info->pinctrl_state_release);
-			if (ret)
-				zinitix_err("failed to select relase pinctrl state\n");
+		} else if (pinctrl_select_state(info->ts_pinctrl,
+					info->pinctrl_state_release)) {
+			/* not into ret: the probe must still fail */
+			zinitix_err("failed to select relase pinctrl state\n");
 		}
 	}
+	misc_info = NULL;
+	misc_touch_dev = NULL;
 	kfree(info);
 err_mem_alloc:
+err_free_switch:
+	if (gpio_is_valid(pdata->gpio_switch))
+		gpio_free(pdata->gpio_switch);
 err_no_platform_data:
 	if (IS_ENABLED(CONFIG_OF))
 		devm_kfree(&client->dev, (void *)pdata);
@@ -4934,15 +5210,27 @@ static int bt541_ts_remove(struct i2c_client *client)
 	struct bt541_ts_info *info = i2c_get_clientdata(client);
 	struct bt541_ts_platform_data *pdata = info->pdata;
 
-	disable_irq(info->irq);
+	/* from here on the IRQ thread and the works leave the chip alone */
+	down(&info->work_lock);
+	info->work_state = REMOVE;
+	up(&info->work_lock);
+
+#if defined(CONFIG_FB)
+	fb_unregister_client(&info->fb_notif);
+	cancel_work_sync(&info->resume_work);
+#endif
+	cancel_delayed_work_sync(&info->recovery_work);
+#if USE_WAKEUP_GESTURE
+	disable_irq_wake(info->irq);
+#endif
+	free_irq(info->irq, info);
+#ifdef SEC_FACTORY_TEST
+	/* outside work_lock: a factory command in progress may wait for it */
+	remove_sec_factory(info);
+#endif
+
 	down(&info->work_lock);
 
-	info->work_state = REMOVE;
-
-#ifdef SEC_FACTORY_TEST
-	kfree(info->factory_info);
-	kfree(info->raw_data);
-#endif
 #if ESD_TIMER_INTERVAL
 	flush_work(&info->tmr_work);
 	write_reg(info->client, BT541_PERIODICAL_INT_INTERVAL, 0);
@@ -4953,14 +5241,13 @@ static int bt541_ts_remove(struct i2c_client *client)
 	destroy_workqueue(esd_tmr_workqueue);
 #endif
 
-	if (info->irq)
-		free_irq(info->irq, info);
-
 	misc_deregister(&touch_misc_device);
 
 	bt541_power_control(info, POWER_OFF);
 	zinitix_power_init(info, false);
 
+	if (gpio_is_valid(pdata->gpio_switch))
+		gpio_free(pdata->gpio_switch);
 	if (gpio_is_valid(pdata->gpio_reset))
 		gpio_free(pdata->gpio_reset);
 	if (gpio_is_valid(pdata->gpio_int))
@@ -4983,14 +5270,12 @@ static int bt541_ts_remove(struct i2c_client *client)
 		}
 	}
 
+	/* frees the input device once its last user lets go */
 	input_unregister_device(info->input_dev);
-	input_free_device(info->input_dev);
+	misc_info = NULL;
+	misc_touch_dev = NULL;
 	up(&info->work_lock);
 	kfree(info);
-
-#if defined(CONFIG_FB)
-	flush_work(&info->resume_work);
-#endif
 
 	return 0;
 }
@@ -5005,11 +5290,14 @@ void bt541_ts_shutdown(struct i2c_client *client)
 	}
 	disable_irq(info->irq);
 	down(&info->work_lock);
+	/* a pending recovery must not switch the chip back on */
+	info->work_state = REMOVE;
 #if ESD_TIMER_INTERVAL
 	flush_work(&info->tmr_work);
 	esd_timer_stop(info);
 #endif
 	up(&info->work_lock);
+	cancel_delayed_work_sync(&info->recovery_work);
 	bt541_power_control(info, POWER_OFF);
 	zinitix_info("----\n");
 }
@@ -5025,7 +5313,57 @@ static const struct dev_pm_ops zinitix_ts_dev_pm_ops = {
 	.resume = bt541_ts_resume,
 };
 #else
+/*
+ * Suspend and resume of the chip follow the display (fb notifier). These
+ * only keep the IRQ thread off the bus while the system sleeps: the
+ * chip stays as the display left it, and its interrupt stays a wakeup
+ * source (a tap wakes the always-on display).
+ */
+#ifdef CONFIG_PM_SLEEP
+static int bt541_ts_pm_suspend(struct device *dev)
+{
+	struct bt541_ts_info *info = dev_get_drvdata(dev);
+
+#if defined(CONFIG_FB)
+	/* a display resume queued before the freeze still uses the bus */
+	flush_work(&info->resume_work);
+#endif
+
+	spin_lock(&info->pm_lock);
+	info->pm_suspended = true;
+	spin_unlock(&info->pm_lock);
+
+	/* a handler that started before the flag finishes on a live bus */
+	synchronize_irq(info->irq);
+
+	return 0;
+}
+
+static int bt541_ts_pm_resume(struct device *dev)
+{
+	struct bt541_ts_info *info = dev_get_drvdata(dev);
+	bool deferred;
+
+	spin_lock(&info->pm_lock);
+	info->pm_suspended = false;
+	deferred = info->irq_deferred;
+	info->irq_deferred = false;
+	spin_unlock(&info->pm_lock);
+
+	/* the I2C controller, our parent, has resumed before us */
+	if (deferred) {
+		zinitix_info("handling the interrupt deferred during suspend\n");
+		disable_irq(info->irq);
+		bt541_touch_work(info->irq, info);
+		enable_irq(info->irq);
+	}
+
+	return 0;
+}
+#endif /* CONFIG_PM_SLEEP */
+
 static const struct dev_pm_ops zinitix_ts_dev_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(bt541_ts_pm_suspend, bt541_ts_pm_resume)
 };
 #endif
 
