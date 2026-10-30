@@ -526,6 +526,8 @@ struct bt541_ts_info {
 	bool device_enabled;
 	bool checkUMSmode;
 	bool enable_wakeup;
+	/* suspend cut the chip's power (enable_wakeup was 0 then) */
+	bool switched_off;
 
 	/*
 	 * System sleep: from our .suspend to our .resume the I2C controller
@@ -2527,28 +2529,23 @@ static int bt541_ts_resume(struct device *dev)
 		return 0;
 	}
 	info->work_state = RESUME;
+	disable_irq(info->irq);
 
-	if (!info->enable_wakeup) {
-		if (pdata->gpio_switch > 0) {
-			err = gpio_direction_output(pdata->gpio_switch, 1);
-			if (err) {
-				zinitix_err("unable to set switch gpio %d\n",
-						pdata->gpio_switch);
-				return -EIO;
-			}
-			bt541_power_control(info, POWER_ON_SEQUENCE);
-
-			info->touch_mode = TOUCH_POINT_MODE;
-			init_touch(info);
-			goto reset_exit;
-		} else {
-			zinitix_info("gpio switch is not valid %d\n",
+	/* follow what suspend did, not what enable_wakeup says now */
+	if (info->switched_off) {
+		info->switched_off = false;
+		err = gpio_direction_output(pdata->gpio_switch, 1);
+		if (err)
+			zinitix_err("unable to set switch gpio %d\n",
 					pdata->gpio_switch);
-		}
+		bt541_power_control(info, POWER_ON_SEQUENCE);
+
+		info->touch_mode = TOUCH_POINT_MODE;
+		init_touch(info);
+		goto reset_exit;
 	}
 
 	/***********Link modify here on 2020/7/23 ***************/
-	disable_irq(info->irq);
 
 	//resume reset init
 	if (gpio_is_valid(pdata->gpio_reset)) {
@@ -2670,7 +2667,8 @@ static int bt541_ts_suspend(struct device *dev)
 			if (err) {
 				zinitix_err("unable to clear switch gpio %d\n",
 						pdata->gpio_switch);
-				return -EIO;
+			} else {
+				info->switched_off = true;
 			}
 		} else {
 			zinitix_info("gpio switch is not valid %d\n",
