@@ -2,17 +2,16 @@
 
 Make automatic brightness work on the watch:
 
-- Fix a kernel bug that holds back brightness changes. **Done**, but it turned out not to cause the symptoms below.
-- Find what does cause them. Most likely userspace (mce), see [What is still open](#what-is-still-open).
-- Then retune the brightness curve to suit me.
+- Fix a kernel bug that holds back brightness changes. **Done**, though it turned out not to cause the symptoms below.
+- Retune the brightness curve to suit me. **Not needed:** I'm happy with automatic brightness as it is (2026-10-30). The section stays as reference.
 
 Status (2026-10-30):
 
 - **Kernel: fixed** on this branch by commit `a8a8df54eaf9`, "msm: mdss: lift the backlight hold at the first frame after unblank". Trial build 004 (`#4-a8a8df5`) ran from `recovery` with no regressions: the `sonic/BUILD.md` checks, the kernel log, and wake and always-on cycles.
 - **But the bug is latent on AsteroidOS 2.1.** mce always sets a brightness level between unblanking the panel and the first frame, so that frame lifts the hold anyway. On the unfixed kernel, none of 26 writes on a static screen after a wake were held back. The fix changes nothing the watch does today. It closes a race that other timings or other userspace could hit.
-- **The symptoms are still open.** The 2026-10-29 evidence for the kernel bug doesn't hold up, see [below](#what-the-2026-10-29-evidence-really-showed).
+- **Nothing else is planned.** I'm happy with automatic brightness as of 2026-10-30. The 2026-10-29 evidence for the kernel bug doesn't hold up anyway, see [below](#what-the-2026-10-29-evidence-really-showed).
 
-## Symptoms
+## Symptoms (2026-10-29, no longer pursued)
 
 - Writing to `/sys/class/leds/lcd-backlight/brightness` seems to do nothing.
 - The Settings brightness slider seems to jump between only two levels, "bright" and "dimmer".
@@ -24,7 +23,7 @@ The panel and the kernel's brightness path work.
 
 - **Panel:** Chipone **ICNA3310** AMOLED, command mode (`msm_fb_panel_info`).
 - **Brightness command:** DCS `0x51 <level>`, one byte, range 1–255 (`qcom,mdss-dsi-bl-pmic-control-type = bl_ctrl_dcs`). The panel's start-up commands enable it (`fe 00`, `51 ff`, `53 20`), so the panel accepts it.
-- **Always-on (ambient) mode** puts the panel in idle mode (DCS `0x39`) and the framebuffer in LP2 (`show_blank_event` = 3). mce then writes its LPM level (47/255 here), and the kernel sends it to the panel. Whether the panel honours `0x51` in idle mode has to be checked by eye.
+- **Always-on (ambient) mode** puts the panel in idle mode (DCS `0x39`) and the framebuffer in LP2 (`show_blank_event` = 3). mce then writes its LPM level (47/255 here), and the kernel sends it to the panel.
 
 ## What the 2026-10-29 evidence really showed
 
@@ -99,15 +98,7 @@ Commit `a8a8df54eaf9`, for meta-rubyfish a `0007-…patch` (`git format-patch -1
 - **Flash to `boot`:** later, together with the touch and sound fixes, after the combined kernel has run from `recovery` for a day.
 - **Upstream:** optional and low priority, since AsteroidOS doesn't hit the bug. If done: an issue and a `0007` patch for AsteroidOS/meta-smartwatch, `meta-rubyfish/recipes-kernel/linux/`.
 
-## What is still open
-
-The symptoms need a new diagnosis, probably in userspace:
-
-- **"Writes do nothing":** see [above](#what-the-2026-10-29-evidence-really-showed). mce overrides manual writes; to try levels by hand, turn automatic brightness off first.
-- **Slider with "two levels":** with automatic brightness on, the slider picks an ALS profile, not a level. At a given light level many profiles give similar brightness. This is the curve, below.
-- **Too dim:** the curve, below. Also check how bright ambient (always-on) mode looks, since mce caps it at its LPM table (47/255 at ~90 lux).
-
-### Related, not fixed here: dead panel at boot
+## Related, not fixed here: dead panel at boot
 
 Sometimes, right after boot, the first frame times out (`wait4pingpong timed out` → `Panel has gone bad … PANEL_ALIVE=0`, see `sonic/BUILD.md`).
 
@@ -116,7 +107,9 @@ Sometimes, right after boot, the first frame times out (`wait4pingpong timed out
 - Android's display HAL reacts to `PANEL_ALIVE=0` by power-cycling the display. Nothing in AsteroidOS does.
 - If it shows up in daily use (a frozen screen right after boot), the fix belongs in userspace (blank/unblank on that uevent) or in the boot-time race itself.
 
-## Retuning the automatic brightness curve (after the kernel fix)
+## Retuning the automatic brightness curve (not needed)
+
+Not needed: I'm happy with automatic brightness as of 2026-10-30. Kept as reference in case that changes.
 
 ### How it works
 
