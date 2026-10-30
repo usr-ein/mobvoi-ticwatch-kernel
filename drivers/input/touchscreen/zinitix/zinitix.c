@@ -518,6 +518,7 @@ struct bt541_ts_info {
 #ifdef SEC_FACTORY_TEST
 	struct tsp_factory_info *factory_info;
 	struct tsp_raw_data *raw_data;
+	struct device *factory_dev;
 #endif
 	struct regulator *vdd;
 	struct regulator *vcc_i2c;
@@ -4094,9 +4095,15 @@ static int init_sec_factory(struct bt541_ts_info *info)
 		list_add_tail(&tsp_cmds[i].list, &factory_info->cmd_list_head);
 
 	sec_class = class_create(THIS_MODULE, "tsp");
+	if (IS_ERR(sec_class)) {
+		zinitix_err("Failed to create class tsp\n");
+		ret = PTR_ERR(sec_class);
+		sec_class = NULL;
+		goto err_create_device;
+	}
 
 	factory_ts_dev = device_create(sec_class, NULL, 0, info, "tsp");
-	if (unlikely(!factory_ts_dev)) {
+	if (IS_ERR_OR_NULL(factory_ts_dev)) {
 		zinitix_err("Failed to create factory dev\n");
 		ret = -ENODEV;
 		goto err_create_device;
@@ -4136,17 +4143,39 @@ static int init_sec_factory(struct bt541_ts_info *info)
 
 	info->factory_info = factory_info;
 	info->raw_data = raw_data;
+	info->factory_dev = factory_ts_dev;
 
 	return ret;
 
 err_create_sysfs:
+	sysfs_remove_link(&factory_ts_dev->kobj, "input");
+	device_unregister(factory_ts_dev);
 err_create_device:
+	if (sec_class)
+		class_destroy(sec_class);
+	sec_class = NULL;
 	kfree(raw_data);
 err_alloc2:
 	kfree(factory_info);
 err_alloc1:
 
 	return ret;
+}
+
+static void remove_sec_factory(struct bt541_ts_info *info)
+{
+	if (!info->factory_dev)
+		return;
+
+	sysfs_remove_group(&info->factory_dev->kobj, &touchscreen_attr_group);
+	sysfs_remove_link(&info->factory_dev->kobj, "input");
+	device_unregister(info->factory_dev);
+	class_destroy(sec_class);
+	sec_class = NULL;
+	info->factory_dev = NULL;
+
+	kfree(info->factory_info);
+	kfree(info->raw_data);
 }
 #endif /* SEC_FACTORY_TEST */
 
@@ -4863,14 +4892,14 @@ static int bt541_ts_probe(struct i2c_client *client,
 		if (ret) {
 			zinitix_err("unable to set direction for gpio %d\n",
 				pdata->gpio_switch);
-			goto err_no_platform_data;
+			goto err_free_switch;
 		}
 	}
 
 	if (!i2c_check_functionality(adapter, I2C_FUNC_I2C)) {
 		zinitix_err("Not compatible i2c function\n");
 		ret = -EIO;
-		goto err_no_platform_data;
+		goto err_free_switch;
 	}
 
 	info = kzalloc(sizeof(struct bt541_ts_info), GFP_KERNEL);
@@ -4886,6 +4915,9 @@ static int bt541_ts_probe(struct i2c_client *client,
 	spin_lock_init(&info->pm_lock);
 	INIT_DELAYED_WORK(&info->recovery_work, bt541_recovery_work);
 	info->recovered_at = jiffies;
+#if defined(CONFIG_FB)
+	INIT_WORK(&info->resume_work, ts_resume_work);
+#endif
 	misc_touch_dev = info;
 
 	ret = zinitix_ts_pinctrl_init(info);
@@ -5074,8 +5106,6 @@ static int bt541_ts_probe(struct i2c_client *client,
 	ret = fb_register_client(&info->fb_notif);
 	if (ret)
 		zinitix_err("Unable to register fb_notifier: %d\n", ret);
-
-	INIT_WORK(&info->resume_work, ts_resume_work);
 #elif defined(CONFIG_HAS_EARLYSUSPEND)
 	info->early_suspend.level = EARLY_SUSPEND_LEVEL_BLANK_SCREEN + 1;
 	info->early_suspend.suspend = zinitix_early_suspend;
@@ -5111,23 +5141,27 @@ static int bt541_ts_probe(struct i2c_client *client,
 
 #ifdef SEC_FACTORY_TEST
 err_kthread_create_failed:
-	kfree(info->factory_info);
-	kfree(info->raw_data);
+	misc_deregister(&touch_misc_device);
 #endif
 err_misc_register:
-	/* the IRQ thread and the recovery leave the chip alone from here */
+	/* the IRQ thread and the works leave the chip alone from here */
 	down(&info->work_lock);
 	info->work_state = REMOVE;
 	up(&info->work_lock);
+#if defined(CONFIG_FB)
+	fb_unregister_client(&info->fb_notif);
+	cancel_work_sync(&info->resume_work);
+#endif
 	cancel_delayed_work_sync(&info->recovery_work);
 	free_irq(info->irq, info);
 err_irq_of_parse:
 err_request_irq:
 #if ESD_TIMER_INTERVAL
 err_input_register_device2:
-
-	input_unregister_device(info->input_dev);
 #endif
+	/* registered: unregistering frees it, input_free_device() must not */
+	input_unregister_device(info->input_dev);
+	info->input_dev = NULL;
 err_touch_init:
 	bt541_power_control(info, POWER_OFF);
 err_power_sequence:
@@ -5149,15 +5183,19 @@ err_gpio_request:
 		if (IS_ERR_OR_NULL(info->pinctrl_state_release)) {
 			devm_pinctrl_put(info->ts_pinctrl);
 			info->ts_pinctrl = NULL;
-		} else {
-			ret = pinctrl_select_state(info->ts_pinctrl,
-						   info->pinctrl_state_release);
-			if (ret)
-				zinitix_err("failed to select relase pinctrl state\n");
+		} else if (pinctrl_select_state(info->ts_pinctrl,
+					info->pinctrl_state_release)) {
+			/* not into ret: the probe must still fail */
+			zinitix_err("failed to select relase pinctrl state\n");
 		}
 	}
+	misc_info = NULL;
+	misc_touch_dev = NULL;
 	kfree(info);
 err_mem_alloc:
+err_free_switch:
+	if (gpio_is_valid(pdata->gpio_switch))
+		gpio_free(pdata->gpio_switch);
 err_no_platform_data:
 	if (IS_ENABLED(CONFIG_OF))
 		devm_kfree(&client->dev, (void *)pdata);
@@ -5172,16 +5210,27 @@ static int bt541_ts_remove(struct i2c_client *client)
 	struct bt541_ts_info *info = i2c_get_clientdata(client);
 	struct bt541_ts_platform_data *pdata = info->pdata;
 
-	disable_irq(info->irq);
+	/* from here on the IRQ thread and the works leave the chip alone */
+	down(&info->work_lock);
+	info->work_state = REMOVE;
+	up(&info->work_lock);
+
+#if defined(CONFIG_FB)
+	fb_unregister_client(&info->fb_notif);
+	cancel_work_sync(&info->resume_work);
+#endif
 	cancel_delayed_work_sync(&info->recovery_work);
+#if USE_WAKEUP_GESTURE
+	disable_irq_wake(info->irq);
+#endif
+	free_irq(info->irq, info);
+#ifdef SEC_FACTORY_TEST
+	/* outside work_lock: a factory command in progress may wait for it */
+	remove_sec_factory(info);
+#endif
+
 	down(&info->work_lock);
 
-	info->work_state = REMOVE;
-
-#ifdef SEC_FACTORY_TEST
-	kfree(info->factory_info);
-	kfree(info->raw_data);
-#endif
 #if ESD_TIMER_INTERVAL
 	flush_work(&info->tmr_work);
 	write_reg(info->client, BT541_PERIODICAL_INT_INTERVAL, 0);
@@ -5192,14 +5241,13 @@ static int bt541_ts_remove(struct i2c_client *client)
 	destroy_workqueue(esd_tmr_workqueue);
 #endif
 
-	if (info->irq)
-		free_irq(info->irq, info);
-
 	misc_deregister(&touch_misc_device);
 
 	bt541_power_control(info, POWER_OFF);
 	zinitix_power_init(info, false);
 
+	if (gpio_is_valid(pdata->gpio_switch))
+		gpio_free(pdata->gpio_switch);
 	if (gpio_is_valid(pdata->gpio_reset))
 		gpio_free(pdata->gpio_reset);
 	if (gpio_is_valid(pdata->gpio_int))
@@ -5222,14 +5270,12 @@ static int bt541_ts_remove(struct i2c_client *client)
 		}
 	}
 
+	/* frees the input device once its last user lets go */
 	input_unregister_device(info->input_dev);
-	input_free_device(info->input_dev);
+	misc_info = NULL;
+	misc_touch_dev = NULL;
 	up(&info->work_lock);
 	kfree(info);
-
-#if defined(CONFIG_FB)
-	flush_work(&info->resume_work);
-#endif
 
 	return 0;
 }
