@@ -1,0 +1,8 @@
+# /etc/systemd/system/kernel-trial.service  (systemctl enable kernel-trial)
+[Unit]
+Description=Return to the normal kernel unless this trial kernel is confirmed
+ConditionKernelCommandLine=sonic.trial=1
+[Service]
+ExecStart=/bin/sh -c 'sleep 600; [ -e /run/sonic-trial-ok ] || systemctl reboot'
+[Install]
+WantedBy=multi-user.target
