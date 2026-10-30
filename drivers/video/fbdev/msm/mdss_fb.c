@@ -1922,12 +1922,25 @@ void mdss_fb_update_backlight(struct msm_fb_data_type *mfd)
 	u32 temp;
 	bool bl_notify = false;
 
-	if (mfd->unset_bl_level == U32_MAX)
+	/*
+	 * Backlight updates are held back from unblank until a frame has
+	 * reached the panel. Once the hold is lifted, there is nothing to do
+	 * here. allow_bl_update is checked again under bl_lock.
+	 */
+	if (mfd->allow_bl_update)
 		return;
 	mutex_lock(&mfd->bl_lock);
 	if (!mfd->allow_bl_update) {
 		pdata = dev_get_platdata(&mfd->pdev->dev);
-		if ((pdata) && (pdata->set_backlight)) {
+		if (mfd->unset_bl_level == U32_MAX) {
+			/*
+			 * No level was requested since unblank. Lift the hold
+			 * anyway: otherwise the next request would wait for
+			 * another frame, which on a static screen may not
+			 * come for a long time.
+			 */
+			mfd->allow_bl_update = true;
+		} else if ((pdata) && (pdata->set_backlight)) {
 			mfd->bl_level = mfd->unset_bl_level;
 			temp = mfd->bl_level;
 			if (mfd->mdp.ad_calc_bl)
