@@ -1,11 +1,16 @@
-# Brightness fix (to do)
+# Brightness fix
 
 Make automatic brightness work on the watch:
 
-- Fix a kernel bug that holds back brightness changes.
+- Fix a kernel bug that holds back brightness changes. **Done**, but it turned out not to cause the symptoms below.
+- Find what does cause them. Most likely userspace (mce), see [What is still open](#what-is-still-open).
 - Then retune the brightness curve to suit me.
 
-Status (2026-10-29): diagnosed, nothing changed yet. Kernel rebuild deferred.
+Status (2026-10-30):
+
+- **Kernel: fixed** on this branch by commit `a8a8df54eaf9`, "msm: mdss: lift the backlight hold at the first frame after unblank". Trial build 004 (`#4-a8a8df5`) ran from `recovery` with no regressions: the `sonic/BUILD.md` checks, the kernel log, and wake and always-on cycles.
+- **But the bug is latent on AsteroidOS 2.1.** mce always sets a brightness level between unblanking the panel and the first frame, so that frame lifts the hold anyway. On the unfixed kernel, none of 26 writes on a static screen after a wake were held back. The fix changes nothing the watch does today. It closes a race that other timings or other userspace could hit.
+- **The symptoms are still open.** The 2026-10-29 evidence for the kernel bug doesn't hold up, see [below](#what-the-2026-10-29-evidence-really-showed).
 
 ## Symptoms
 
@@ -13,114 +18,103 @@ Status (2026-10-29): diagnosed, nothing changed yet. Kernel rebuild deferred.
 - The Settings brightness slider seems to jump between only two levels, "bright" and "dimmer".
 - Automatic brightness looks erratic and generally too dim.
 
-## Diagnosis
+## The panel
 
-The panel and the brightness path are fine. **The kernel holds back brightness changes until the screen redraws.**
+The panel and the kernel's brightness path work.
 
 - **Panel:** Chipone **ICNA3310** AMOLED, command mode (`msm_fb_panel_info`).
 - **Brightness command:** DCS `0x51 <level>`, one byte, range 1–255 (`qcom,mdss-dsi-bl-pmic-control-type = bl_ctrl_dcs`). The panel's start-up commands enable it (`fe 00`, `51 ff`, `53 20`), so the panel accepts it.
-- **Proof that changes are held back:** `/sys/class/graphics/fb0/bl_event` counts brightness updates actually sent to the panel. On a static screen it does not change after a write:
-  ```
-  ssh sonic-screwdriver 'E=/sys/class/graphics/fb0/bl_event; B=/sys/class/leds/lcd-backlight/brightness
-    c0=$(cat $E); echo 150 > $B; c1=$(cat $E); echo "$c0 -> $c1"'
-  # 2026-10-29: 6014 -> 6014  (held back)
-  ```
-- **Visual check:** stepping 255 → 64 → 16 → 4 *while scrolling a list*, so the screen redraws constantly, gives clearly different brightness levels. On a static screen it does nothing.
+- **Always-on (ambient) mode** puts the panel in idle mode (DCS `0x39`) and the framebuffer in LP2 (`show_blank_event` = 3). mce then writes its LPM level (47/255 here), and the kernel sends it to the panel. Whether the panel honours `0x51` in idle mode has to be checked by eye.
 
-### Root cause in the kernel
+## What the 2026-10-29 evidence really showed
+
+The `6014 -> 6014` check (a `bl_event` that doesn't move after a write) doesn't prove a hold-back:
+
+- **`bl_event` isn't counted while the framebuffer is blanked or in a low-power state.** `mdss_fb_bl_update_notify()` returns early while `mfd->update.is_suspend` is set, which happens for any blank, always-on included. On 2026-10-29 the always-on display was on, so "screen off" meant LP2. A write there reaches the panel but doesn't move `bl_event`. Measured 2026-10-30 in ambient: the read-back went 39 → 47 while `bl_event` stayed the same.
+- **A write while the panel is fully off is kept for the next wake**, by design. mce then sets its own level anyway.
+- **mce re-applies its own level** at every wake, dim and ALS change, so a manual write lasts only until mce's next one.
+- **Continuous redraws hide a hold-back.** On one boot on the charger, the launcher redrew at 60 fps the whole time the screen was on (cause unclear; after a reboot it didn't come back).
+
+**A correct check:**
+
+1. The screen must be on: `show_blank_event` says `panel_power_on = 1`.
+2. It must be static: the `play` counter in `/sys/kernel/debug/mdp/stat` doesn't move for a couple of seconds.
+3. Then write a level, and compare the read-back and `bl_event`:
+
+```sh
+ssh sonic-screwdriver 'F=/sys/class/graphics/fb0; B=/sys/class/leds/lcd-backlight/brightness
+  cat $F/show_blank_event; grep play /sys/kernel/debug/mdp/stat; sleep 2; grep play /sys/kernel/debug/mdp/stat
+  b0=$(cat $B); v=$(( b0 > 128 ? b0 - 60 : b0 + 60 )); e0=$(cat $F/bl_event); echo $v > $B
+  echo "wrote $v: read back $(cat $B), bl_event $e0 -> $(cat $F/bl_event)"; echo $b0 > $B'
+```
+
+Held back means the read-back keeps the old level and `bl_event` doesn't move. Applied means the read-back is the new level and `bl_event` went up by one. The read-back is `mfd->bl_level`, the level the kernel last sent.
+
+## The kernel bug (fixed)
 
 - **Source:** `mobvoi/mobvoi-ticwatch-kernel`, branch `mobvoi-android-msm-rover-4.9`, commit `c428ef3654d52e816308a6cf11009a1742f86c1c`. AsteroidOS's `meta-rubyfish` adds patches 0001–0006, none of which touch the display.
 - **File:** `drivers/video/fbdev/msm/mdss_fb.c`.
 
-How the block is supposed to work:
+How the hold is meant to work:
 
-1. **On unblank** (`mdss_fb_blank_sub`, around line 2147), the driver sets `allow_bl_update = false`, so the backlight doesn't come on before the first frame reaches the panel.
-2. **While blocked**, `mdss_fb_set_backlight()` only stores the requested value in `unset_bl_level` and returns.
-3. **After each frame** (the `skip_commit:` path, around line 4043), `mdss_fb_update_backlight()` applies any held-back value and sets `allow_bl_update = true`.
+1. **On unblank** from off (`mdss_fb_blank_unblank()`), the driver sends any level stored while the panel was off, then sets `allow_bl_update = false`. The backlight must not change again before the first frame reaches the panel.
+2. **While the hold is on**, `mdss_fb_set_backlight()` only stores the requested level in `unset_bl_level`.
+3. **After each frame** (`__mdss_fb_perform_commit()`, the `skip_commit:` path, after a kickoff that succeeded), `mdss_fb_update_backlight()` sends a stored level and sets `allow_bl_update = true`. That is its only caller. The unblank's own frame doesn't go through it.
 
-The bug is that `mdss_fb_update_backlight()` returns early when nothing is pending (`unset_bl_level == U32_MAX`), *without* lifting the block. If mce's first write after a wake arrives after the first frame, the block stays on. Every write then waits for the next redraw, and a watch face only redraws about once a minute.
+The bug: `mdss_fb_update_backlight()` returned early when no level was stored (`unset_bl_level == U32_MAX`), *without* lifting the hold. If no level is requested between unblank and the first frame, the next request waits for another frame. On a static watch face that can be a minute.
 
-### Proposed patch (untested)
+### Why AsteroidOS doesn't hit it
 
-Lift the block at the first frame after unblank even when nothing is pending:
+mce's debug log of one wake (2026-10-30):
 
-```diff
---- a/drivers/video/fbdev/msm/mdss_fb.c
-+++ b/drivers/video/fbdev/msm/mdss_fb.c
-@@ void mdss_fb_update_backlight(struct msm_fb_data_type *mfd)
--	if (mfd->unset_bl_level == U32_MAX)
--		return;
-+	if (mfd->unset_bl_level == U32_MAX) {
-+		/*
-+		 * Nothing pending, but a frame has now reached the panel since
-+		 * unblank, so stop holding back later brightness writes.
-+		 */
-+		mutex_lock(&mfd->bl_lock);
-+		mfd->allow_bl_update = true;
-+		mutex_unlock(&mfd->bl_lock);
-+		return;
-+	}
-```
+1. mce unblanks the framebuffer itself (`mce_fbdev_set_power(up)`, about 270 ms).
+2. Right after, `mdy_brightness_force_level(): brightness from 0 to 1`. The hold is on, so that level is stored.
+3. Only then does mce ask the compositor to draw (`setUpdatesEnabled`), and once it answers, mce fades 1 → target.
 
-Before building, check the other callers of `mdss_fb_update_backlight()` outside `mdss_fb.c`, such as `mdss_mdp_overlay.c`, to make sure each one runs only after a frame has gone out.
+So a level is always pending at the first frame, and that frame lifts the hold. Waking from always-on mode (LP2 → on) doesn't set the hold at all.
 
-## Plan: build, test, flash
+### The fix
 
-What I know so far:
+Commit `a8a8df54eaf9`, for meta-rubyfish a `0007-…patch` (`git format-patch -1 a8a8df54eaf9`):
 
-- **Docker** works on the Mac. The watch's kernel is **32-bit ARM** (`CONFIG_ARM=y`, `armv7l`), so the build is a cross-compile (`ARCH=arm`, an `arm-linux-gnueabihf-` toolchain) inside a Linux container.
-- **The watch's exact kernel config** is available from `/proc/config.gz`.
-- **No kernel modules are loaded**, though `/lib/modules/4.9.232` exists.
-- **Running kernel:** `4.9.232 #1 SMP PREEMPT Wed Nov 3 10:42:30 UTC 2021`. That is `c428ef36`'s commit time to the second (the build date comes from the source commit), so the running kernel was built from it.
+- At the first frame after unblank, lift the hold even when no level is pending.
+- Decide under `bl_lock`. The patch first proposed here checked `unset_bl_level` without the lock, so a level stored in between would have been dropped.
+- The lockless early return now tests `allow_bl_update`, so later frames still don't take the lock.
+- Only `mdss_fb_update_backlight` changes, by 16 bytes of code. The config, device trees and all 9046 exported symbol CRCs are unchanged.
 
-Steps:
+## Build and test
 
-1. **Sources:** this branch. It starts from `asteroidos-2.1`, which is `c428ef36` plus meta-rubyfish's patches 0001–0005 from `meta-smartwatch`'s `2.0` branch (what AsteroidOS **2.1** is built from) and the watch's running config as `arch/arm/configs/asteroidos-rubyfish_defconfig`.
-   - `0006-net-bcmhd-Allow-compilation-as-module.patch` is left out on purpose. It came after 2.1 and turns Wi-Fi into a module that the 2.1 system doesn't expect.
-   - Check it out on a case-sensitive filesystem, such as a Docker volume. On macOS's default case-insensitive filesystem, 12 pairs of netfilter files whose names differ only in case (`xt_DSCP.c` and `xt_dscp.c`, …) overwrite each other and break the build.
-2. **Add the fix** as a commit on this branch. For meta-rubyfish it becomes `0007-…patch`.
-3. **Configure:** `make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- asteroidos-rubyfish_defconfig`. That file is the watch's `/proc/config.gz`, so diff it against the watch's before the first build. For sound, also restore stock's tracing settings (see [sound.md](sound.md), on the `sound` branch).
-4. **Build** the same image type as the release, with the same appended device trees for rubyfish and rover. Check `linux-rubyfish_p.bb` for `KERNEL_IMAGETYPE` and any custom deploy step. The release ships it as `zImage-dtb-rubyfish.fastboot`.
-5. **Repack the boot image.** Unpack the 2.1 one (`~/Downloads/asteroidos-rubyfish-2.1/asteroid-rubyfish-boot.img`) with `unpack_bootimg`. Then rebuild it with `mkbootimg`, using the new kernel and the same ramdisk, command line, base, page size and offsets.
-6. **Test without touching the installed kernel. No USB is needed.** Write the test image to the **recovery** partition over SSH and boot it once. The 2.1 kernel stays on `boot`.
-   ```
-   scp new-boot.img sonic-screwdriver:/tmp/
-   ssh sonic-screwdriver 'dd if=/tmp/new-boot.img of=/dev/block/platform/msm_sdcc.1/by-name/recovery && sync && systemctl reboot recovery'
-   ```
-   - Before rebooting, read the partition back and compare checksums. The image must fit the 32 MiB partition; the 2.1 one is about 13 MB.
-   - If the reboot argument isn't honoured, run `ssh sonic-screwdriver reboot bootloader` and choose Recovery mode in the fastboot menu (bottom button cycles, top button selects).
-   - If the test kernel hangs, hold the top button for about 8 s. The PMIC forces a restart that boots the 2.1 kernel from `boot`. The persistent journal keeps the failed boot's logs.
-   - With the watch on the USB dock, `fastboot boot new-boot.img` is an alternative, but a 2023 porter reported this bootloader may not support it.
+- **Build and trial-boot** exactly as in `sonic/BUILD.md` (on branch `asteroidos-2.1`). It replaces the plan that was here. Note that systemd 257 on the watch rejects `systemctl reboot recovery`; use `systemctl reboot --reboot-argument=recovery`.
+- **Results, 2026-10-30.** Build 002 has the same code as the release; build 004 is this branch. "Writes" are two levels written after each wake on a static screen, then put back.
 
-   **Making sure Wi-Fi comes up, or that the watch comes back without it:**
-   - **Match the running kernel.** Use the same source, the same 2.1 patches and the config from `/proc/config.gz`. The Wi-Fi driver is built in, its firmware and NVRAM are on `/vendor`, and its MAC is in `/persist`, so a matching build brings Wi-Fi up as today.
-   - **Check on the Mac before writing anything to the watch:**
-     - the config diff contains only the intended changes;
-     - the appended device tree is byte-identical to the running one (`/sys/firmware/fdt` on the watch);
-     - the command line and ramdisk are identical to the 2.1 boot image's.
-   - **Baseline trial first:** the first test kernel has no fixes. If it boots with Wi-Fi, the build pipeline is proven, and a later failure points at a patch.
-   - **Trial command line:** append `sonic.trial=1 msm_poweroff.download_mode=0`. Download mode is **on** today (`/sys/module/msm_poweroff/parameters/download_mode` = 1). With it on, a panic parks the watch in Qualcomm's USB dump mode instead of rebooting. With it off, the existing 5 s panic timeout (`CONFIG_PANIC_TIMEOUT=5`, panic on oops) reboots into the normal kernel.
-   - **Automatic rollback ("dead man's switch").** Install this once on the watch. It does nothing on normal boots:
-     ```
-     # /etc/systemd/system/kernel-trial.service  (systemctl enable kernel-trial)
-     [Unit]
-     Description=Return to the normal kernel unless this trial kernel is confirmed
-     ConditionKernelCommandLine=sonic.trial=1
-     [Service]
-     ExecStart=/bin/sh -c 'sleep 600; [ -e /run/sonic-trial-ok ] || systemctl reboot'
-     [Install]
-     WantedBy=multi-user.target
-     ```
-     Once the trial looks good over SSH, `touch /run/sonic-trial-ok` keeps it running. Otherwise, after 10 minutes it reboots into the normal kernel on its own. The trial only boots from recovery once, so that reboot lands on `boot`.
-   - **Remaining case:** a hang that never panics and never reaches userspace still needs the top button held for about 8 s.
-   - Check that `uname -v` shows the new build.
-   - Blank and unblank (`mcetool --blank-screen; mcetool --unblank-screen`), then run the `bl_event` check above. The counter must now go up on every write.
-   - Look at the screen: brightness should follow writes and the slider immediately.
-7. **Flash** only once it works. Write it to `boot` the same way, over SSH (or with `fastboot flash boot`).
-   - Keep the known-good 2.1 kernel in `recovery`, so the button-driven fastboot menu can always reach a working kernel. USB is then only needed if both partitions end up broken.
-   - Rollback is the original 2.1 boot image above.
-   - The full stock backup is in `~/Documents/sonic-screwdriver/stock-backup/`.
-8. **Upstream:** open an issue on AsteroidOS/meta-smartwatch (label `rubyfish`) with this diagnosis, and a PR adding the patch to `meta-rubyfish/recipes-kernel/linux/`.
+  | Test | Build 002 (unfixed) | Build 004 (fixed) |
+  |---|---|---|
+  | Power key, then unlock (like a button press and a touch) | 4 wakes, 8/8 writes applied at once | 3 wakes, 6/6 |
+  | `mcetool --unblank-screen` (the earlier recipe) | 2 wakes, 4/4 | 2 wakes, 4/4 |
+  | Automatic brightness off and/or instant unblank fade | 7 wakes, 14/14 | 2 wakes, 4/4 |
+  | Always-on cycles: on → ambient → on | dims 89 → 47 in LP2; write after wake applied (2 cycles; the cable was pulled during the 2nd) | 5 cycles, the same |
+
+  - In every wake the screen was static again about 1.2 s later. The tests changed mce settings only during the run and restored them.
+  - The kernel log of the trial boot differs from the reference boots only by version strings and by the environment: cable unplugged, Wi-Fi, touch.
+- **Flash to `boot`:** later, together with the touch and sound fixes, after the combined kernel has run from `recovery` for a day.
+- **Upstream:** optional and low priority, since AsteroidOS doesn't hit the bug. If done: an issue and a `0007` patch for AsteroidOS/meta-smartwatch, `meta-rubyfish/recipes-kernel/linux/`.
+
+## What is still open
+
+The symptoms need a new diagnosis, probably in userspace:
+
+- **"Writes do nothing":** see [above](#what-the-2026-10-29-evidence-really-showed). mce overrides manual writes; to try levels by hand, turn automatic brightness off first.
+- **Slider with "two levels":** with automatic brightness on, the slider picks an ALS profile, not a level. At a given light level many profiles give similar brightness. This is the curve, below.
+- **Too dim:** the curve, below. Also check how bright ambient (always-on) mode looks, since mce caps it at its LPM table (47/255 at ~90 lux).
+
+### Related, not fixed here: dead panel at boot
+
+Sometimes, right after boot, the first frame times out (`wait4pingpong timed out` → `Panel has gone bad … PANEL_ALIVE=0`, see `sonic/BUILD.md`).
+
+- `panel_dead` then makes `__mdss_fb_perform_commit()` drop every frame, and brightness changes are held back.
+- Both last until the next blank and unblank.
+- Android's display HAL reacts to `PANEL_ALIVE=0` by power-cycling the display. Nothing in AsteroidOS does.
+- If it shows up in daily use (a frozen screen right after boot), the fix belongs in userspace (blank/unblank on that uevent) or in the boot-time race itself.
 
 ## Retuning the automatic brightness curve (after the kernel fix)
 
@@ -177,11 +171,13 @@ It's read through `sensorfwd` (`hybrisalsadaptor`) and only reports when the lig
 
 ### Also noticed
 
-When the screen wakes, mce treats "no reading yet" as darkness and starts at the darkest step until the first lux sample arrives. If that shows as a dim flash on wake, look at mce's `als` handling. Otherwise ignore it.
+- At every wake mce first sets level 1, then fades to its target over 90 ms (2026-10-30 debug log). The "darkest step until the first lux sample" seen before may be that. If it shows as a dim flash on wake, look at mce's `als` handling. Otherwise ignore it.
+- **Nightstand mode.** While the watch charges, the launcher sets the brightness setting to its nightstand value (30%) and turns always-on off. It restores both 5 s after the watch comes off the charger. So the brightness setting seen while charging isn't the one in daily use.
 
-## Current watch state (2026-10-29)
+## Current watch state (2026-10-30)
 
-- **Automatic brightness:** off (`als_enabled=false`; the `als_autobrightness` flag is still on).
-- **Brightness setting:** 50%.
-- **mce logging:** back to `warning`.
-- **Screen timeout:** normal (no stay-on inhibit).
+- **Automatic brightness:** on (`als_enabled` and `als_autobrightness` both enabled).
+- **Brightness setting:** 30%. That is also the launcher's nightstand value, but it stayed at 30% off the charger too.
+- **Always-on display:** off (`/org/asteroidos/settings/always-on-display=false`).
+- **mce logging:** `warning`.
+- **Kernel:** trial build 004 (`#4-a8a8df5`) from `recovery`; `boot` holds the 2.1 release kernel.
