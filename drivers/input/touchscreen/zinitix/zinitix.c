@@ -2697,6 +2697,8 @@ static int fb_notifier_callback(struct notifier_block *self,
 			schedule_work(&misc_touch_dev->resume_work);
 		} else if (*blank == FB_BLANK_POWERDOWN ||
 				*blank == FB_BLANK_NORMAL) {
+			/* a resume still queued would undo this suspend */
+			flush_work(&misc_touch_dev->resume_work);
 			bt541_ts_suspend(&misc_touch_dev->client->dev);
 		}
 	}
