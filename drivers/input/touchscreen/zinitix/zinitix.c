@@ -38,6 +38,7 @@
 #include <linux/of_irq.h>
 #include <linux/io.h>
 #include <linux/power_supply.h>
+#include <linux/suspend.h>
 
 #include <linux/kernel.h>
 #include <linux/hrtimer.h>
@@ -525,6 +526,15 @@ struct bt541_ts_info {
 	bool device_enabled;
 	bool checkUMSmode;
 	bool enable_wakeup;
+
+	/*
+	 * System sleep: from our .suspend to our .resume the I2C controller
+	 * may be suspended, so the IRQ thread leaves the chip alone and
+	 * .resume handles the interrupt it deferred.
+	 */
+	spinlock_t pm_lock;
+	bool pm_suspended;
+	bool irq_deferred;
 };
 
 #ifdef CONFIG_HAS_EARLYSUSPEND
@@ -2161,6 +2171,32 @@ static void clear_report_data(struct bt541_ts_info *info)
 #define	PALM_REPORT_WIDTH	200
 #define	PALM_REJECT_WIDTH	255
 
+/*
+ * Called first by the IRQ thread. Between our .suspend and .resume the
+ * I2C controller may already be suspended, or have its interrupt
+ * disabled by suspend_device_irqs(), and every transfer would time out:
+ * the chip would look dead. So leave the event in the chip until its
+ * interrupt status is cleared, abort the system suspend as an armed
+ * wakeup interrupt does, and let .resume handle the interrupt.
+ */
+static bool bt541_defer_irq(struct bt541_ts_info *info)
+{
+	bool defer;
+
+	spin_lock(&info->pm_lock);
+	defer = info->pm_suspended;
+	if (defer)
+		info->irq_deferred = true;
+	spin_unlock(&info->pm_lock);
+
+	if (defer) {
+		pm_wakeup_event(&info->client->dev, 500);
+		pm_system_wakeup();
+	}
+
+	return defer;
+}
+
 static irqreturn_t bt541_touch_work(int irq, void *data)
 {
 	struct bt541_ts_info *info = (struct bt541_ts_info *)data;
@@ -2184,6 +2220,9 @@ static irqreturn_t bt541_touch_work(int irq, void *data)
 
 	zinitix_debug("%s:%d touch_info.status 0x%x\n", __func__, __LINE__,
 		      info->touch_info.status);
+
+	if (bt541_defer_irq(info))
+		return IRQ_HANDLED;
 
 	if (down_trylock(&info->work_lock)) {
 		zinitix_err("Failed to occupy work lock\n");
@@ -4656,6 +4695,7 @@ static int bt541_ts_probe(struct i2c_client *client,
 	info->client = client;
 	info->pdata = pdata;
 	info->device_enabled = 1;
+	spin_lock_init(&info->pm_lock);
 	misc_touch_dev = info;
 
 	ret = zinitix_ts_pinctrl_init(info);
@@ -4825,6 +4865,9 @@ static int bt541_ts_probe(struct i2c_client *client,
 	}
 
 	pdata->tsp_irq = info->irq;
+
+	/* the wakeup source bt541_defer_irq() reports to */
+	device_init_wakeup(&client->dev, true);
 
 	ret = request_threaded_irq(info->irq, NULL, bt541_touch_work,
 				   IRQF_TRIGGER_FALLING | IRQF_ONESHOT,
@@ -5025,7 +5068,57 @@ static const struct dev_pm_ops zinitix_ts_dev_pm_ops = {
 	.resume = bt541_ts_resume,
 };
 #else
+/*
+ * Suspend and resume of the chip follow the display (fb notifier). These
+ * only keep the IRQ thread off the bus while the system sleeps: the
+ * chip stays as the display left it, and its interrupt stays a wakeup
+ * source (a tap wakes the always-on display).
+ */
+#ifdef CONFIG_PM_SLEEP
+static int bt541_ts_pm_suspend(struct device *dev)
+{
+	struct bt541_ts_info *info = dev_get_drvdata(dev);
+
+#if defined(CONFIG_FB)
+	/* a display resume queued before the freeze still uses the bus */
+	flush_work(&info->resume_work);
+#endif
+
+	spin_lock(&info->pm_lock);
+	info->pm_suspended = true;
+	spin_unlock(&info->pm_lock);
+
+	/* a handler that started before the flag finishes on a live bus */
+	synchronize_irq(info->irq);
+
+	return 0;
+}
+
+static int bt541_ts_pm_resume(struct device *dev)
+{
+	struct bt541_ts_info *info = dev_get_drvdata(dev);
+	bool deferred;
+
+	spin_lock(&info->pm_lock);
+	info->pm_suspended = false;
+	deferred = info->irq_deferred;
+	info->irq_deferred = false;
+	spin_unlock(&info->pm_lock);
+
+	/* the I2C controller, our parent, has resumed before us */
+	if (deferred) {
+		zinitix_info("handling the interrupt deferred during suspend\n");
+		disable_irq(info->irq);
+		bt541_touch_work(info->irq, info);
+		enable_irq(info->irq);
+	}
+
+	return 0;
+}
+#endif /* CONFIG_PM_SLEEP */
+
 static const struct dev_pm_ops zinitix_ts_dev_pm_ops = {
+	SET_SYSTEM_SLEEP_PM_OPS(bt541_ts_pm_suspend, bt541_ts_pm_resume)
 };
 #endif
 
