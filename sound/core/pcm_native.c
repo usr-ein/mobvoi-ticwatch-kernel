@@ -824,6 +824,83 @@ static int snd_pcm_status_user(struct snd_pcm_substream *substream,
 	return 0;
 }
 
+#if BITS_PER_LONG == 32
+/*
+ * 32-bit user space built with a 64-bit time_t (glibc's _TIME_BITS=64, as
+ * the y2038 work in Linux 5.6 allows) passes struct snd_pcm_status with
+ * 64-bit timespecs. Its size differs, so its STATUS and STATUS_EXT ioctls
+ * have their own numbers. This is the layout of Linux 5.6's
+ * struct snd_pcm_status64; it has no implicit padding.
+ */
+struct snd_pcm_status64 {
+	snd_pcm_state_t state;		/* stream state */
+	u8 rsvd[4];
+	s64 trigger_tstamp_sec;		/* time when stream was started/stopped/paused */
+	s64 trigger_tstamp_nsec;
+	s64 tstamp_sec;			/* reference timestamp */
+	s64 tstamp_nsec;
+	snd_pcm_uframes_t appl_ptr;	/* appl ptr */
+	snd_pcm_uframes_t hw_ptr;	/* hw ptr */
+	snd_pcm_sframes_t delay;	/* current delay in frames */
+	snd_pcm_uframes_t avail;	/* number of frames available */
+	snd_pcm_uframes_t avail_max;	/* max frames available on hw since last status */
+	snd_pcm_uframes_t overrange;	/* count of ADC (capture) overrange detections from last status */
+	snd_pcm_state_t suspended_state; /* suspended stream state */
+	__u32 audio_tstamp_data;	 /* needed for 64-bit alignment, used for configs/report to/from userspace */
+	s64 audio_tstamp_sec;		/* sample counter, wall clock, PHC or on-demand sync'ed */
+	s64 audio_tstamp_nsec;
+	s64 driver_tstamp_sec;		/* useful in case reference system tstamp is reported with delay */
+	s64 driver_tstamp_nsec;
+	__u32 audio_tstamp_accuracy;	/* in ns units, only valid if indicated in audio_tstamp_data */
+	unsigned char reserved[52-4*sizeof(s64)]; /* must be filled with zero */
+};
+
+#define SNDRV_PCM_IOCTL_STATUS64	_IOR('A', 0x20, struct snd_pcm_status64)
+#define SNDRV_PCM_IOCTL_STATUS_EXT64	_IOWR('A', 0x24, struct snd_pcm_status64)
+
+static int snd_pcm_status_user64(struct snd_pcm_substream *substream,
+				 struct snd_pcm_status64 __user *_status,
+				 bool ext)
+{
+	struct snd_pcm_status64 status64;
+	struct snd_pcm_status status;
+	int res;
+
+	memset(&status, 0, sizeof(status));
+	memset(&status64, 0, sizeof(status64));
+	/* as in snd_pcm_status_user() */
+	if (ext && get_user(status.audio_tstamp_data,
+				(u32 __user *)(&_status->audio_tstamp_data)))
+		return -EFAULT;
+	res = snd_pcm_status(substream, &status);
+	if (res < 0)
+		return res;
+
+	status64.state = status.state;
+	status64.trigger_tstamp_sec = status.trigger_tstamp.tv_sec;
+	status64.trigger_tstamp_nsec = status.trigger_tstamp.tv_nsec;
+	status64.tstamp_sec = status.tstamp.tv_sec;
+	status64.tstamp_nsec = status.tstamp.tv_nsec;
+	status64.appl_ptr = status.appl_ptr;
+	status64.hw_ptr = status.hw_ptr;
+	status64.delay = status.delay;
+	status64.avail = status.avail;
+	status64.avail_max = status.avail_max;
+	status64.overrange = status.overrange;
+	status64.suspended_state = status.suspended_state;
+	status64.audio_tstamp_data = status.audio_tstamp_data;
+	status64.audio_tstamp_sec = status.audio_tstamp.tv_sec;
+	status64.audio_tstamp_nsec = status.audio_tstamp.tv_nsec;
+	status64.driver_tstamp_sec = status.driver_tstamp.tv_sec;
+	status64.driver_tstamp_nsec = status.driver_tstamp.tv_nsec;
+	status64.audio_tstamp_accuracy = status.audio_tstamp_accuracy;
+
+	if (copy_to_user(_status, &status64, sizeof(status64)))
+		return -EFAULT;
+	return 0;
+}
+#endif /* BITS_PER_LONG == 32 */
+
 static int snd_pcm_channel_info(struct snd_pcm_substream *substream,
 				struct snd_pcm_channel_info * info)
 {
@@ -2798,6 +2875,117 @@ static int snd_pcm_sync_ptr(struct snd_pcm_substream *substream,
 	return 0;
 }
 
+#if BITS_PER_LONG == 32
+/*
+ * struct snd_pcm_sync_ptr as 32-bit user space with a 64-bit time_t passes
+ * it: the layout of Linux 5.6's struct __snd_pcm_sync_ptr64. Architectures
+ * that cannot mmap the status and control records, ARM among them, always
+ * go through this ioctl.
+ */
+#ifdef __BIG_ENDIAN
+typedef char __pad_before_uframe[sizeof(u64) - sizeof(snd_pcm_uframes_t)];
+typedef char __pad_after_uframe[0];
+#else
+typedef char __pad_before_uframe[0];
+typedef char __pad_after_uframe[sizeof(u64) - sizeof(snd_pcm_uframes_t)];
+#endif
+
+struct snd_pcm_mmap_status64 {
+	snd_pcm_state_t state;		/* RO: state - SNDRV_PCM_STATE_XXXX */
+	u32 pad1;			/* Needed for 64 bit alignment */
+	__pad_before_uframe __pad1;
+	snd_pcm_uframes_t hw_ptr;	/* RO: hw ptr (0...boundary-1) */
+	__pad_after_uframe __pad2;
+	s64 tstamp_sec;			/* Timestamp */
+	s64 tstamp_nsec;
+	snd_pcm_state_t suspended_state;/* RO: suspended stream state */
+	u32 pad3;			/* Needed for 64 bit alignment */
+	s64 audio_tstamp_sec;		/* sample counter or wall clock */
+	s64 audio_tstamp_nsec;
+};
+
+struct snd_pcm_mmap_control64 {
+	__pad_before_uframe __pad1;
+	snd_pcm_uframes_t appl_ptr;	 /* RW: appl ptr (0...boundary-1) */
+	__pad_before_uframe __pad2;	 /* sic: the ABI has no __pad_after_uframe here */
+
+	__pad_before_uframe __pad3;
+	snd_pcm_uframes_t  avail_min;	 /* RW: min available frames for wakeup */
+	__pad_after_uframe __pad4;
+};
+
+struct snd_pcm_sync_ptr64 {
+	u32 flags;
+	u32 pad1;
+	union {
+		struct snd_pcm_mmap_status64 status;
+		unsigned char reserved[64];
+	} s;
+	union {
+		struct snd_pcm_mmap_control64 control;
+		unsigned char reserved[64];
+	} c;
+};
+
+#define SNDRV_PCM_IOCTL_SYNC_PTR64	_IOWR('A', 0x23, struct snd_pcm_sync_ptr64)
+
+/* snd_pcm_sync_ptr() for struct snd_pcm_sync_ptr64 */
+static int snd_pcm_sync_ptr64(struct snd_pcm_substream *substream,
+			      struct snd_pcm_sync_ptr64 __user *_sync_ptr)
+{
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	struct snd_pcm_sync_ptr64 sync_ptr;
+	volatile struct snd_pcm_mmap_status *status;
+	volatile struct snd_pcm_mmap_control *control;
+	int err;
+	snd_pcm_uframes_t hw_avail;
+
+	memset(&sync_ptr, 0, sizeof(sync_ptr));
+	if (get_user(sync_ptr.flags, (u32 __user *)&(_sync_ptr->flags)))
+		return -EFAULT;
+	if (copy_from_user(&sync_ptr.c.control, &(_sync_ptr->c.control),
+			   sizeof(struct snd_pcm_mmap_control64)))
+		return -EFAULT;
+	status = runtime->status;
+	control = runtime->control;
+	if (sync_ptr.flags & SNDRV_PCM_SYNC_PTR_HWSYNC) {
+		err = snd_pcm_hwsync(substream);
+		if (err < 0)
+			return err;
+	}
+	snd_pcm_stream_lock_irq(substream);
+	if (!(sync_ptr.flags & SNDRV_PCM_SYNC_PTR_APPL))
+		control->appl_ptr = sync_ptr.c.control.appl_ptr;
+	else
+		sync_ptr.c.control.appl_ptr = control->appl_ptr;
+	if (!(sync_ptr.flags & SNDRV_PCM_SYNC_PTR_AVAIL_MIN))
+		control->avail_min = sync_ptr.c.control.avail_min;
+	else
+		sync_ptr.c.control.avail_min = control->avail_min;
+
+	if (runtime->render_flag & SNDRV_NON_DMA_MODE) {
+		hw_avail = snd_pcm_playback_hw_avail(runtime);
+		if ((hw_avail >= runtime->start_threshold)
+			&& (runtime->render_flag &
+				SNDRV_RENDER_STOPPED)) {
+			if (substream->ops->restart)
+				substream->ops->restart(substream);
+		}
+	}
+	sync_ptr.s.status.state = status->state;
+	sync_ptr.s.status.hw_ptr = status->hw_ptr;
+	sync_ptr.s.status.tstamp_sec = status->tstamp.tv_sec;
+	sync_ptr.s.status.tstamp_nsec = status->tstamp.tv_nsec;
+	sync_ptr.s.status.suspended_state = status->suspended_state;
+	sync_ptr.s.status.audio_tstamp_sec = status->audio_tstamp.tv_sec;
+	sync_ptr.s.status.audio_tstamp_nsec = status->audio_tstamp.tv_nsec;
+	snd_pcm_stream_unlock_irq(substream);
+	if (copy_to_user(_sync_ptr, &sync_ptr, sizeof(sync_ptr)))
+		return -EFAULT;
+	return 0;
+}
+#endif /* BITS_PER_LONG == 32 */
+
 static int snd_pcm_tstamp(struct snd_pcm_substream *substream, int __user *_arg)
 {
 	struct snd_pcm_runtime *runtime = substream->runtime;
@@ -2858,6 +3046,14 @@ static int snd_pcm_common_ioctl1(struct file *file,
 		return snd_pcm_delay(substream, arg);
 	case SNDRV_PCM_IOCTL_SYNC_PTR:
 		return snd_pcm_sync_ptr(substream, arg);
+#if BITS_PER_LONG == 32
+	case SNDRV_PCM_IOCTL_STATUS64:
+		return snd_pcm_status_user64(substream, arg, false);
+	case SNDRV_PCM_IOCTL_STATUS_EXT64:
+		return snd_pcm_status_user64(substream, arg, true);
+	case SNDRV_PCM_IOCTL_SYNC_PTR64:
+		return snd_pcm_sync_ptr64(substream, arg);
+#endif
 #ifdef CONFIG_SND_SUPPORT_OLD_API
 	case SNDRV_PCM_IOCTL_HW_REFINE_OLD:
 		return snd_pcm_hw_refine_old_user(substream, arg);
