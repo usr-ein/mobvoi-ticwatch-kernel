@@ -353,8 +353,16 @@ a fresh normal boot, and a control boot of the release kernel from
 - **Environment noise:** Wi-Fi association and deauthentication messages (the
   access point's doing), USB gadget lines while the cable is plugged in, touch
   `mini_init_touch` / `zinitix_resume_proc err` (the known touch-driver bug),
-  nanohub battery and sensor lines, `IRQn no longer affine to CPUn`, and
+  nanohub battery and sensor lines, `IRQn no longer affine to CPUn`,
+  `spmi spmi-0: cleanup_irq …` (some boots, the release kernel's too), and
   systemd messages that reach the kernel log at different moments.
+- **Cable unplugged:** the reference boot above was on the USB cable. Off the
+  cable the watch already suspends in the first 90 s, so a trial boot then also
+  shows suspend and resume lines (`PM: suspend entry`/`exit`, `Freezing …`,
+  `dhdsdio_suspend`/`resume Enter`, `gic_show_resume_irq`, wakeup sources)
+  and lacks the USB ones (`android_work`, `msm_hsusb`, `configfs-gadget`,
+  `ipa_get_transport_type … IPA HW is not supported`). Seen with
+  `brightness-fix` on 2026-10-30.
 
 ## Gotchas
 
