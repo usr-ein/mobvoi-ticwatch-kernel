@@ -58,6 +58,7 @@
 #include <linux/slab.h>
 
 #include "i2c-core.h"
+#include "i2c-speaker-cap.h"
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/i2c.h>
@@ -2481,11 +2482,17 @@ static int i2c_check_for_quirks(struct i2c_adapter *adap, struct i2c_msg *msgs, 
  */
 int __i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
 {
+	struct i2c_spkcap_ctx spkcap;
 	unsigned long orig_jiffies;
 	int ret, try;
 
 	if (adap->quirks && i2c_check_for_quirks(adap, msgs, num))
 		return -EOPNOTSUPP;
+
+	/* Keep the watch's speaker amplifier below its loudness cap. */
+	ret = i2c_spkcap_begin(adap, msgs, num, &spkcap);
+	if (ret)
+		return ret;
 
 	/* i2c_trace_msg gets enabled when tracepoint i2c_transfer gets
 	 * enabled.  This is an efficient way of keeping the for-loop from
@@ -2509,6 +2516,8 @@ int __i2c_transfer(struct i2c_adapter *adap, struct i2c_msg *msgs, int num)
 		if (time_after(jiffies, orig_jiffies + adap->timeout))
 			break;
 	}
+
+	i2c_spkcap_end(&spkcap);
 
 	if (static_key_false(&i2c_trace_msg)) {
 		int i;
@@ -3351,7 +3360,12 @@ s32 i2c_smbus_xfer(struct i2c_adapter *adapter, u16 addr, unsigned short flags,
 
 	flags &= I2C_M_TEN | I2C_CLIENT_PEC | I2C_CLIENT_SCCB;
 
-	if (adapter->algo->smbus_xfer) {
+	/*
+	 * SMBus to the speaker amplifier always goes through the emulation,
+	 * so that its writes reach __i2c_transfer() and the loudness cap.
+	 */
+	if (adapter->algo->smbus_xfer &&
+	    !i2c_spkcap_is_amp(adapter, addr, flags)) {
 		i2c_lock_bus(adapter, I2C_LOCK_SEGMENT);
 
 		/* Retry automatically on arbitration loss */
