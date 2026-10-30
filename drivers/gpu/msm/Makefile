@@ -1,4 +1,8 @@
 ccflags-y := -Iinclude/linux
+# kgsl_trace.o and adreno_trace.o, which define the tracepoints, are not
+# built: keep every trace_*() call here an empty stub, even with
+# CONFIG_TRACEPOINTS on (see include/linux/tracepoint.h).
+ccflags-y += -DNOTRACE
 
 msm_kgsl_core-y = \
 	kgsl.o \

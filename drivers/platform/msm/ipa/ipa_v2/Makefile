@@ -1,3 +1,8 @@
+# ipa.c does not define the tracepoints (no CREATE_TRACE_POINTS): keep
+# every trace_*() call here an empty stub, even with CONFIG_TRACEPOINTS on
+# (see include/linux/tracepoint.h).
+ccflags-y += -DNOTRACE
+
 obj-$(CONFIG_IPA) += ipat.o
 ipat-y := ipa.o ipa_debugfs.o ipa_hdr.o ipa_flt.o ipa_rt.o ipa_dp.o ipa_client.o \
 	ipa_utils.o ipa_nat.o ipa_intf.o teth_bridge.o ipa_interrupts.o \
