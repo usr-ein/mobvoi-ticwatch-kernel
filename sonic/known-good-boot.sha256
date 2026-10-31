@@ -1,0 +1,8 @@
+# Boot images known to boot and run well on this watch (TicWatch Pro 3 Ultra,
+# rover, AsteroidOS 2.1). flash-recovery.sh writes a trial to `recovery` only
+# while `boot` holds one of these, so a failed trial always falls back to a
+# good kernel; `--fallback IMAGE` writes one of these to `recovery`.
+# Add an image only after it has run on the watch for a while.
+# sha256                                                            size      what
+721638fcebabbc7148855430f138da4abed6bdbd1cea173f42d493c3cdddc76f  13758464  AsteroidOS 2.1 release (asteroid-rubyfish-boot.img)
+3f4a5b7a1f5a76e0f3404b430e4eea19ba50f16d7a9957e8fa2168375dddddb2  14409728  build 022 (#22-13ebf00, asteroidos-2.1 @ 61784db6) + msm_poweroff.download_mode=0; in boot since 2026-10-31 after a 16 h trial
