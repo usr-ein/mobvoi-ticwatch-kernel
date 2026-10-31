@@ -20,10 +20,13 @@ listed under [Files and variables](#files-and-variables).
 
 Read these before touching the watch.
 
-- **Only `recovery` is ever written.** Never write `boot` or any other
-  partition. `boot` holds the AsteroidOS 2.1 release kernel and is what the
-  watch falls back to. `flash-recovery.sh` refuses to run if `boot` does not
-  hold it.
+- **Only `recovery` is ever written by these tools.** Never write `boot` or
+  any other partition from a script. `boot` holds a known-good kernel, i.e.
+  one listed in `sonic/known-good-boot.sha256`: the AsteroidOS 2.1 release, or
+  since 2026-10-31 the permanent sound kernel. It is what the watch falls back
+  to, and `flash-recovery.sh` refuses to write a trial unless `boot` holds one
+  of them. Writing `boot` is a deliberate manual step, only with the user's OK
+  (see "Making a kernel permanent").
 - **Allowed writes on the watch:** the `recovery` partition,
   `/etc/systemd/system/kernel-trial.service` and
   `/etc/systemd/system/kernel-trial-wifi.service` with their enable symlinks,
@@ -360,15 +363,41 @@ Set `B` to the build directory, e.g. `B=~/Documents/sonic-screwdriver/build/kern
    (a plain reboot always boots `boot`). `recovery` keeps the trial image; it
    only runs on an explicit reboot into recovery.
 
-To put the release kernel back into `recovery` (it was there before the first
-trial; the original contents are in `build/kernel/backups/`):
+Since 2026-10-31 `recovery` holds the AsteroidOS 2.1 release between trials,
+as the fallback the bootloader menu can reach. A trial overwrites it, so put it
+back afterwards (`flash-recovery.sh` reminds you when it overwrites a
+known-good image):
 
 ```sh
-R=~/Downloads/asteroidos-rubyfish-2.1/asteroid-rubyfish-boot.img
-ssh sonic-screwdriver 'cat > /tmp/r.img' < "$R"
-ssh sonic-screwdriver 'P=/dev/block/platform/msm_sdcc.1/by-name/recovery; dd if=/tmp/r.img of=$P bs=1M conv=fsync status=none && sync && head -c 13758464 $P | sha512sum && rm /tmp/r.img'
-# must print b834a219865371f8…, the release's SHA-512
+"$T/sonic/flash-recovery.sh" --fallback ~/Downloads/asteroidos-rubyfish-2.1/asteroid-rubyfish-boot.img
 ```
+
+`--fallback` writes only images listed in `sonic/known-good-boot.sha256` and
+reads the partition back. `--check`, with or without `--fallback`, runs every
+check and writes nothing.
+
+## Making a kernel permanent
+
+Done once, on 2026-10-31, after trial build 022 had run for 16 h with no oops,
+no new warnings and no touch or I2C errors. The user approved it explicitly.
+The steps, all by hand:
+
+1. **Build the image.** Take the trial build's kernel and ramdisk unchanged, and
+   change only the cmdline: the release's plus `msm_poweroff.download_mode=0`,
+   without `sonic.trial=1`.
+   ```sh
+   python3 -I sonic/bootimg.py unpack "$B/boot.img" "$U"
+   python3 -I sonic/bootimg.py pack -o "$B/boot-final.img" --kernel "$U/kernel" --ramdisk "$U/ramdisk" \
+       --cmdline "<release cmdline> msm_poweroff.download_mode=0" --board rubyfish --base 0x80000000 \
+       --kernel_offset 0x8000 --ramdisk_offset 0x01000000 --second_offset 0x00f00000 --tags_offset 0x100 --pagesize 2048
+   python3 -I sonic/bootimg.py compare ~/Downloads/asteroidos-rubyfish-2.1/asteroid-rubyfish-boot.img \
+       "$B/boot-final.img" --extra "msm_poweroff.download_mode=0"
+   ```
+   The compare must show the ramdisk and both DTBs identical, and the cmdline equal to the release's plus the extra argument.
+2. **Write `boot`.** First check that `boot` holds a known-good image. Then `dd` the new image to `boot`, read it back, and compare its sha256. `recovery` still holds the trial kernel, so one working kernel is always installed.
+3. **Reboot normally,** then check `uname -v`, `/proc/cmdline`, the health check and the audio bring-up.
+4. **Restore the fallback:** `flash-recovery.sh --fallback` with the 2.1 release image into `recovery`.
+5. **Add the new image** to `sonic/known-good-boot.sha256`, so later trials accept it as the fallback in `boot`.
 
 ### Telling the kernel apart from the boot path: the control image
 
