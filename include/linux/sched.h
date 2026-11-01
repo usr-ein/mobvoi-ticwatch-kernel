@@ -1904,11 +1904,7 @@ struct task_struct {
 				     - initialized normally by setup_new_exec */
 /* file system info */
 	struct nameidata *nameidata;
-#ifdef CONFIG_SYSVIPC
-/* ipc stuff */
-	struct sysv_sem sysvsem;
-	struct sysv_shm sysvshm;
-#endif
+/* ipc stuff: sysvsem and sysvshm are at the end, after 'thread' */
 #ifdef CONFIG_DETECT_HUNG_TASK
 /* hung task detection */
 	unsigned long last_switch_count;
@@ -2205,8 +2201,29 @@ struct task_struct {
  * WARNING: on x86, 'thread_struct' contains a variable-sized
  * structure.  It *MUST* be at the end of 'task_struct'.
  *
- * Do not put anything below here!
+ * Do not put anything below here, except the SysV IPC members: ARM's
+ * 'thread_struct' has a fixed size, so they can follow it.
  */
+#ifdef CONFIG_SYSVIPC
+#ifndef __GENKSYMS__
+/*
+ * ipc stuff. Upstream has these right after 'nameidata'. They sit last,
+ * and genksyms doesn't see them (RHEL's kABI technique), so that
+ * CONFIG_SYSVIPC keeps the module ABI of Mobvoi's stock vendor modules
+ * (/vendor/lib/modules/audio_*.ko). Those were built for a kernel without
+ * SysV IPC, and MODVERSIONS checks CRCs of theirs that cover task_struct
+ * (through struct mutex, for one). Here, every other member keeps its
+ * offset, and genksyms sees the struct as it is without CONFIG_SYSVIPC.
+ * Only ipc/ and kernel/{fork,exit,kcmp}.c use these members, by name; a
+ * module never allocates a task_struct, so the larger size is harmless.
+ */
+#ifdef CONFIG_ARCH_WANTS_DYNAMIC_TASK_STRUCT
+#error "the SysV IPC members after 'thread' need a fixed-size thread_struct"
+#endif
+	struct sysv_sem sysvsem;
+	struct sysv_shm sysvshm;
+#endif /* !__GENKSYMS__ */
+#endif /* CONFIG_SYSVIPC */
 };
 
 #ifdef CONFIG_ARCH_WANTS_DYNAMIC_TASK_STRUCT
