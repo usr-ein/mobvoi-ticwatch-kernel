@@ -23,7 +23,8 @@ Read these before touching the watch.
 - **Only `recovery` is ever written by these tools.** Never write `boot` or
   any other partition from a script. `boot` holds a known-good kernel, i.e.
   one listed in `sonic/known-good-boot.sha256`: the AsteroidOS 2.1 release, or
-  since 2026-10-31 the permanent sound kernel. It is what the watch falls back
+  a kernel made permanent since (build 022 on 2026-10-31, build 023 with SysV
+  IPC on 2026-11-01). It is what the watch falls back
   to, and `flash-recovery.sh` refuses to write a trial unless `boot` holds one
   of them. Writing `boot` is a deliberate manual step, only with the user's OK
   (see "Making a kernel permanent").
@@ -402,8 +403,15 @@ check and writes nothing.
 
 ## Making a kernel permanent
 
-Done once, on 2026-10-31, after trial build 022 had run for 16 h with no oops,
-no new warnings and no touch or I2C errors. The user approved it explicitly.
+Done twice, each time with the user's explicit OK:
+
+- **Build 022** on 2026-10-31, after 16 h on trial with no oops, no new warnings
+  and no touch or I2C errors.
+- **Build 023** (SysV IPC, `todos/sysvipc.md`) on 2026-11-01, after 15.7 h on
+  trial with the same result. Step 3's reboot was left to the user. Step 5
+  came before step 4: once the known-good list names the new image,
+  `flash-recovery.sh --fallback` checks that `boot` holds it.
+
 The steps, all by hand:
 
 1. **Build the image.** Take the trial build's kernel and ramdisk unchanged, and
@@ -418,7 +426,7 @@ The steps, all by hand:
        "$B/boot-final.img" --extra "msm_poweroff.download_mode=0"
    ```
    The compare must show the ramdisk and both DTBs identical, and the cmdline equal to the release's plus the extra argument.
-2. **Write `boot`.** First check that `boot` holds a known-good image. Then `dd` the new image to `boot`, read it back, and compare its sha256. `recovery` still holds the trial kernel, so one working kernel is always installed.
+2. **Write `boot`.** First check that `boot` holds a known-good image. Then `dd` the new image to `boot`, read it back, and compare its sha256. Drop the page cache before the read-back (`sync; echo 3 > /proc/sys/vm/drop_caches`), so that it reads the flash rather than the cache. `recovery` still holds the trial kernel, so one working kernel is always installed.
 3. **Reboot normally,** then check `uname -v`, `/proc/cmdline`, the health check and the audio bring-up, and, with `CONFIG_SYSVIPC`, run `semtest` (see step 4 of the trial).
 4. **Restore the fallback:** `flash-recovery.sh --fallback` with the 2.1 release image into `recovery`.
 5. **Add the new image** to `sonic/known-good-boot.sha256`, so later trials accept it as the fallback in `boot`.
