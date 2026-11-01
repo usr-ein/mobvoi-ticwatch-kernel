@@ -122,7 +122,7 @@ Then, by hand (BUILD.md, "Making a kernel permanent"):
    - Against 022's `boot-final.img`, only the kernel differs.
 2. **Written to `boot`** (mmcblk0p26) at 16:46 UTC. Before writing, `boot` held 022's known-good image and `recovery` the 023 trial image. Read back from the flash, with the page cache dropped first, it is identical.
 3. **Added to `sonic/known-good-boot.sha256`** by this change.
-4. **Fallback restored.** `flash-recovery.sh --fallback` put the AsteroidOS 2.1 release back into `recovery` (sha256 `721638fc…`), and it read back identical.
+4. **Fallback restored.** `flash-recovery.sh --fallback` put the AsteroidOS 2.1 release back into `recovery` (sha256 `721638fc…`) at 16:50 UTC. It read back identical from the flash, as did `boot`. The first attempt had stopped silently before writing anything, because `recovery` held the unlisted trial image; the fix to `holds()` in `flash-recovery.sh` was committed together with this note.
 
 The watch was not rebooted.
 

@@ -101,6 +101,7 @@ holds() {
     while read -r h n desc; do
         [ "$(val "${1}_$n")" = "$h" ] && { echo "$desc"; return; }
     done < <(known)
+    return 0  # none matched: empty output; a non-zero status would end the script (set -e)
 }
 boot_name=$(holds boot); rec_name=$(holds recovery)
 rdev=$(val recovery); bdev=$(printf '%s\n' "$remote" | sed -n 's/.* boot=\(.*\)/\1/p')
