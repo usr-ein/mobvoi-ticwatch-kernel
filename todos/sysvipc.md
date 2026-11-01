@@ -6,7 +6,7 @@ Status (2026-11-01):
 
 - **Done in the kernel.** This branch adds two commits, listed [below](#the-fix). With them, `semget()` and the rest of SysV IPC work, and the 25 stock audio modules keep their ABI: every CRC they check still matches (`modcrc.py`: 493 match, 0 mismatch, 0 missing), and every `task_struct` member they can reach keeps its offset.
 - **Trial build 023** (`#23-fc9ef77`) has run from `recovery` since 2026-11-01 01:04 UTC. It was confirmed healthy 164 s after boot. SysV IPC works: the test program passes as `ceres`, and at boot mkcal, loaded by asteroid-launcher, created its lock and, for the first time on this watch, its database. The 25 audio modules load, and the kernel log shows nothing new. See [Trial](#trial).
-- **Not permanent yet.** Writing it to `boot` waits for a day on the trial, then the user's OK (BUILD.md, "Making a kernel permanent").
+- **Permanent since 2026-11-01 16:46 UTC**, with the user's OK, after 15.7 h on trial. `boot` holds 023's `boot-final.img` (sha256 `79c5f9c3…`), and `recovery` holds the AsteroidOS 2.1 release again. The watch keeps running the trial boot until the user reboots it. See [Made permanent](#made-permanent).
 
 ## Why
 
@@ -104,8 +104,30 @@ The 2026-11-01 trial followed BUILD.md, off the cable.
 9. **Bluetooth.** The iPhone was connected again by 61 s: one connected device. ioslink logged `ancs: subscribed` and the Sonic app's `bridge: hello` at 64.6 s.
 10. **Confirmed** at 164 s (01:06:36 UTC) with `trial-check.sh --confirm`. The dead-man's switch left it running past 600 s.
 
+## Made permanent
+
+On 2026-11-01 the user approved writing build 023 to `boot` ("Yes, deploy the new kernel to boot it's okay"). At 16:45 UTC they asked for it right away rather than after a full day. By then the trial boot had run for 15.7 h:
+
+- **Still the trial boot.** It runs `#23-fc9ef77` with `sonic.trial=1`, so there was no crash or reboot.
+- **Kernel log.** I saved the log of the whole boot in three overlapping pieces, because the journal keeps only about 10 h. It shows only the two known boot WARNINGs: no oops or BUG, no touch or I2C errors, no module load errors. The watch suspended about 26,600 times.
+- **Audio.** The 25 audio modules are loaded, and `sonic-audio.service` is active (success).
+- **mkcal is in use.** There are three SysV semaphore sets of `ceres` (mode 0777). Sonic's calendar import brought in six snapshots this boot, the last at 15:23 CET (94 events in 4 notebooks), with no semaphore error.
+- **`semtest` as `ceres`** passes.
+- **Battery** at 74 %, charging.
+
+Then, by hand (BUILD.md, "Making a kernel permanent"):
+
+1. **The image, `023-sysvipc/boot-final.img`.** It holds the trial's kernel (`zImage-dtb`, sha256 `844586d9…`), the release's ramdisk, and the release cmdline plus `msm_poweroff.download_mode=0`. It is 14432256 bytes, sha256 `79c5f9c372c2f34d90356fdeef5531e6d16b2b62fbd4a2de3f052b20a04c7ad5`.
+   - Against the release, `bootimg.py compare` shows the ramdisk and both DTBs identical, and the cmdline is the release's plus the extra argument.
+   - Against 022's `boot-final.img`, only the kernel differs.
+2. **Written to `boot`** (mmcblk0p26) at 16:46 UTC. Before writing, `boot` held 022's known-good image and `recovery` the 023 trial image. Read back from the flash, with the page cache dropped first, it is identical.
+3. **Added to `sonic/known-good-boot.sha256`** by this change.
+4. **Fallback restored.** `flash-recovery.sh --fallback` put the AsteroidOS 2.1 release back into `recovery` (sha256 `721638fc…`), and it read back identical.
+
+The watch was not rebooted.
+
 ## What remains
 
-- A day on the trial kernel, with the user's usual use, then the user's OK to make it permanent, as for build 022: build `boot-final.img` from `023-sysvipc/boot.img`, write `boot`, reboot, check, put the 2.1 release back in `recovery` (`flash-recovery.sh --fallback`), and add the image to `sonic/known-good-boot.sha256`.
+- The first boot from `boot`, which is the user's. Afterwards, check `uname -v` (`#23-fc9ef77`), `/proc/cmdline` (no `sonic.trial=1`), `trial-check.sh`, the audio bring-up and `semtest`, as BUILD.md says ("Making a kernel permanent", step 3).
 - Then Sonic's calendar import and the Agenda app can use mkcal. That is userspace work, outside this branch. `ceres` lingers (`loginctl`: `Linger=yes`), so logind's default `RemoveIPC=yes` never removes mkcal's semaphores while the watch runs.
 - Adding more members to `task_struct` (or to any struct the stock modules see) later: append them at the end and hide them from genksyms the same way, then check with `modcrc.py`, a `Module.symvers` comparison and pahole.
