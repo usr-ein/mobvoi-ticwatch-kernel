@@ -338,6 +338,30 @@ Set `B` to the build directory, e.g. `B=~/Documents/sonic-screwdriver/build/kern
    (`bt541_ts`) drivers bound, `asteroid-launcher` running, and no
    oops/BUG/WARN beyond the two the normal kernel also prints at boot.
 
+   **SysV IPC: `semtest` as `ceres` passes.** This applies to kernels with
+   `CONFIG_SYSVIPC`, which `asteroidos-2.1` has since build 023 (see
+   `todos/sysvipc.md`). `sonic/semtest.c` checks what mkcal, the calendar
+   store, needs, plus the two `task_struct` members this kernel keeps at the
+   end of the struct. Build it once, with no libc, using the kernel's cross
+   compiler. Then run it as `ceres`. The run deletes the binary from `/tmp`
+   again, because the watch's `/tmp` is on the persistent root file system:
+
+   ```sh
+   docker run --rm -v "$T":/t sonic-kernel-builder arm-linux-gnueabi-gcc \
+       -Os -marm -march=armv7-a -static -nostdlib -ffreestanding \
+       -fno-builtin -fno-stack-protector -fno-pic -no-pie \
+       -o /t/sonic-semtest /t/sonic/semtest.c
+   ssh -l ceres sonic-screwdriver 'f=/tmp/sonic-semtest; cat > $f && chmod 755 $f && $f; rc=$?; rm -f $f; exit $rc' < "$T/sonic-semtest"
+   ```
+
+   It must end with `RESULT: SysV semaphores and shared memory work`, exit
+   status 0. It removes every semaphore set and segment it creates. Its `info`
+   lines count waits that a suspend attempt cut short with `EINTR`. Dozens
+   are normal off the cable: every suspend attempt, aborted ones included,
+   interrupts a waiting `semop`/`semtimedop`, and the test retries, as mkcal
+   does. A kernel without SysV IPC stops at the first `semget` with `-38`
+   (`ENOSYS`).
+
 5. **Compare kernel logs** (normalised; shows messages only one boot has):
 
    ```sh
@@ -395,7 +419,7 @@ The steps, all by hand:
    ```
    The compare must show the ramdisk and both DTBs identical, and the cmdline equal to the release's plus the extra argument.
 2. **Write `boot`.** First check that `boot` holds a known-good image. Then `dd` the new image to `boot`, read it back, and compare its sha256. `recovery` still holds the trial kernel, so one working kernel is always installed.
-3. **Reboot normally,** then check `uname -v`, `/proc/cmdline`, the health check and the audio bring-up.
+3. **Reboot normally,** then check `uname -v`, `/proc/cmdline`, the health check and the audio bring-up, and, with `CONFIG_SYSVIPC`, run `semtest` (see step 4 of the trial).
 4. **Restore the fallback:** `flash-recovery.sh --fallback` with the 2.1 release image into `recovery`.
 5. **Add the new image** to `sonic/known-good-boot.sha256`, so later trials accept it as the fallback in `boot`.
 
@@ -536,6 +560,7 @@ a fresh normal boot, and a control boot of the release kernel from
 | `flash-recovery.sh` | Mac | write a trial image to `recovery` over SSH, with safety checks |
 | `trial-check.sh` | Mac | health check of the running kernel over SSH; `--confirm` |
 | `klog-compare.py` | Mac | diff two kernel logs |
+| `semtest.c` | watch, as `ceres` | SysV IPC check for kernels with `CONFIG_SYSVIPC`: static, no libc; the build command is in the file and in "Trial boot" |
 | `kernel-trial.service` | watch | the dead-man's switch |
 | `kernel-trial-wifi.service` | watch | reconnects the saved Wi-Fi network if a trial boots without it |
 

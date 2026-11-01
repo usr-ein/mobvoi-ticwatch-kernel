@@ -67,7 +67,7 @@ Build 023 is `sysvipc` @ `fc9ef77`, built 2026-11-01 00:51 UTC, against permanen
 | `task_struct` layout (pahole on both builds' DWARF) | all 181 members of 022 at the same offset and size. `sysvsem` is at 1740 and `sysvshm` at 1744, right after `thread` (1600 + 140). The size stays 1792, with tail padding 52 → 40. |
 | every struct in `vmlinux` (pahole, 9395 types) | none removed. 29 new, all SysV IPC ones (`sem_undo`, `shm_file_data`, `semid64_ds`, …). `task_struct` is the only existing struct that changed. |
 
-The test program, `sonic-semtest`, is a 3.8 KB static ARM binary that uses raw system calls and no libc, so the kernel's own cross compiler builds it. Run as `ceres`, it:
+The test program, [`sonic/semtest.c`](../sonic/semtest.c), builds to a static ARM binary of about 5 KB. It makes raw system calls and needs no libc, so the kernel's own cross compiler builds it. BUILD.md's trial checks (step 4) give the build and run commands. Run as `ceres`, it:
 
 - does what mkcal does: looks a key up with `semget`, creates the set with `IPC_CREAT|IPC_EXCL`, then runs `SETALL`, `GETVAL`, and lock and unlock with `semop` and `SEM_UNDO`;
 - checks that a held lock blocks, with `IPC_NOWAIT` and with a 200 ms `semtimedop`;
@@ -76,7 +76,7 @@ The test program, `sonic-semtest`, is a 3.8 KB static ARM binary that uses raw s
   - a child exits holding the lock, and the kernel must undo it (`exit_sem`, `sysvsem.undo_list`);
   - a child creates, writes and leaves a shared memory segment that the parent then finds by key (`newseg`/`exit_shm`, `sysvshm.shm_clist`).
 
-It removes everything it creates. On build 022 it stops at the first `semget`: `-38` (`ENOSYS`). Its source is not in this repository. It is on the Mac, in `~/.cache/sonic-screwdriver/kernel-023-sysvipc/semtest/` (`semtest.c`, built with `arm-linux-gnueabi-gcc -Os -marm -march=armv7-a -static -nostdlib -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -no-pie` in `sonic-kernel-builder`).
+It removes everything it creates. On build 022 it stops at the first `semget`: `-38` (`ENOSYS`).
 
 ## Trial
 
