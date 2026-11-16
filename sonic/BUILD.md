@@ -384,6 +384,15 @@ Set `B` to the build directory, e.g. `B=~/Documents/sonic-screwdriver/build/kern
 7. Run the fix's own tests (each `todos/*.md` on its branch says what), and ask
    the user to try the screen and touch by hand.
 
+   **The panel's page after full brightness:** `sonic/panel-page-check.sh`
+   applies to kernels with the boost-mode-out fix, which `asteroidos-2.1` has
+   since build 025. It runs on the watch, detached; the three commands are in
+   its header. It sets brightness 100 % and back through mce, as the
+   flashlight does, then reads the panel's selected page (FFh) and its
+   brightness (52h) through debugfs. It writes nothing to the panel. It must
+   end `RESULT: PASS`. Without the fix, the page reads 70 and the brightness
+   stays at ff.
+
 8. **Back to the normal kernel:** `ssh sonic-screwdriver systemctl reboot`
    (a plain reboot always boots `boot`). `recovery` keeps the trial image; it
    only runs on an explicit reboot into recovery.
@@ -498,6 +507,10 @@ a fresh normal boot, and a control boot of the release kernel from
 - **Kernels with the speaker cap** (`sound`, from build 020) add, at every
   boot: `i2c-speaker-cap: speaker amplifier 2-0034 held at least 20.0 dB below
   full gain` (22.0 in builds 020 and 021). Seen with `sound` on 2026-10-30.
+- **Kernels with the boost-mode-out fix** (from build 025) add, at every boot,
+  right after `Panel Name = icna3310 cmd mode dsi panel`:
+  `mdss_dsi_cmds_end_on_user_page: boost mode out ended on page 0x70: FE 00
+  appended`. Seen on 2026-11-16.
 
 ## Gotchas
 
@@ -553,6 +566,19 @@ a fresh normal boot, and a control boot of the release kernel from
   AsteroidOS's build has the same. Errors stop the build.
 - `adb` over the USB cable gives a root shell (`adb shell`) on both kernels;
   there is no USB networking (`usb-moded` fails on rover).
+- **The panel's commands don't come from this tree's device trees.**
+  - `rover.dts` and `rubyfish.dts` are flat stock trees (AsteroidOS's patch
+    0005). They have no panel node.
+  - The `dsi-panel-*.dtsi` files are only included by the overlays
+    (`rover-overlay.dts`), which this build doesn't build.
+  - The bootloader applies the stock overlay from the watch's own `dtbo`
+    partition at every boot (`androidboot.dtbo_idx=0` on the cmdline). The
+    panel's on, off, idle and boost command lists come from there.
+  - So editing a panel dtsi here changes nothing the watch boots: build 024,
+    with such an edit, had DTBs byte for byte the release's (2026-11-16).
+  - Fix panel commands in `mdss_dsi_panel.c`, as the boost-mode-out fix does.
+    Never write `dtbo`: it applies to every boot, `boot` and `recovery` alike,
+    and the dead-man's switch doesn't cover it.
 
 ## Files and variables
 
@@ -569,6 +595,7 @@ a fresh normal boot, and a control boot of the release kernel from
 | `trial-check.sh` | Mac | health check of the running kernel over SSH; `--confirm` |
 | `klog-compare.py` | Mac | diff two kernel logs |
 | `semtest.c` | watch, as `ceres` | SysV IPC check for kernels with `CONFIG_SYSVIPC`: static, no libc; the build command is in the file and in "Trial boot" |
+| `panel-page-check.sh` | watch, as root | the boost-mode-out fix's check: brightness 100 % and back through mce, then the panel's page (FFh) and brightness (52h); reads only |
 | `kernel-trial.service` | watch | the dead-man's switch |
 | `kernel-trial-wifi.service` | watch | reconnects the saved Wi-Fi network if a trial boots without it |
 
