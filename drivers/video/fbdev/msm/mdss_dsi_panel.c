@@ -1279,6 +1279,48 @@ exit_free:
 	return -ENOMEM;
 }
 
+/*
+ * A command list that switches the panel to a manufacturer command page
+ * (FE xx, xx != 0) must switch back to the user page (FE 00) before it ends:
+ * the brightness the kernel writes next (51 xx) addresses register 0x51 of
+ * whatever page is selected. The ICNA3310's boost mode out, as the watch's
+ * stock dtbo overlay gives it, ends with FE 70; 66 47, so after full
+ * brightness every brightness write landed on page 0x70 and the screen stayed
+ * at full brightness until the panel next powered up. Append FE 00, with the
+ * header of the list's own FE command, to such a list: it is still sent as
+ * one command request.
+ */
+static char dcs_user_page[2] = {0xFE, 0x00};	/* DTYPE_DCS_WRITE1 */
+
+static void mdss_dsi_cmds_end_on_user_page(struct dsi_panel_cmds *pcmds,
+		const char *name)
+{
+	struct dsi_cmd_desc *cmds;
+	int i, last = -1;
+
+	for (i = 0; i < pcmds->cmd_cnt; i++)
+		if (pcmds->cmds[i].dchdr.dlen == 2 &&
+		    pcmds->cmds[i].payload[0] == dcs_user_page[0])
+			last = i;
+	if (last < 0 || pcmds->cmds[last].payload[1] == dcs_user_page[1])
+		return;
+
+	cmds = krealloc(pcmds->cmds, (pcmds->cmd_cnt + 1) * sizeof(*cmds),
+			GFP_KERNEL);
+	if (!cmds) {
+		pr_err("%s: %s: no memory, left on page 0x%02x\n", __func__,
+			name, (u8)pcmds->cmds[last].payload[1]);
+		return;
+	}
+	cmds[pcmds->cmd_cnt].dchdr = cmds[last].dchdr;
+	cmds[pcmds->cmd_cnt].dchdr.last = 1;
+	cmds[pcmds->cmd_cnt].payload = dcs_user_page;
+	pcmds->cmds = cmds;
+	pcmds->cmd_cnt++;
+	pr_info("%s: %s ended on page 0x%02x: FE 00 appended\n", __func__,
+		name, (u8)cmds[last].payload[1]);
+}
+
 
 int mdss_panel_get_dst_fmt(u32 bpp, char mipi_mode, u32 pixel_packing,
 				char *dst_format)
@@ -2994,6 +3036,8 @@ static int mdss_panel_parse_dt(struct device_node *np,
 	mdss_dsi_parse_dcs_cmds(np, &ctrl_pdata->boost_mode_out_cmds,
 		"qcom,mdss-dsi-boost-mode-out-command",
 		"qcom,mdss-dsi-boost-mode-out-command-state");
+	mdss_dsi_cmds_end_on_user_page(&ctrl_pdata->boost_mode_out_cmds,
+		"boost mode out");
 
 	rc = of_property_read_u32(np, "qcom,mdss-dsi-idle-fps", &tmp);
 	pinfo->mipi.frame_rate_idle = (!rc ? tmp : 60);
