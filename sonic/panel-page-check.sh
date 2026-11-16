@@ -15,16 +15,19 @@
 #      kernel sent "boost mode in"), else the result is INCONCLUSIVE;
 #   3. sets the user's brightness again: the LED must drop below 255 and
 #      hbm_mode read 0 (the kernel sent "boost mode out", then 51 <level>);
-#   4. reads two panel registers through debugfs (DCS reads, nothing written
-#      to the panel): FFh, the command page the panel has selected, and 52h,
-#      its brightness.
-# PASS: page 00 and 52h equal to the LED level. Without the fix, 52h stays
-# stuck at ff (measured 2026-11-16, read after selecting page 0 by hand).
-# That boost mode out then leaves page 70 selected is inferred, from the
-# stock list and the datasheet (p.112): no unfixed kernel has run this script,
-# and FFh has only ever read 00 on this panel. So a PASS rests on 52h. The
-# user's brightness setting ends as it was, and the screen is blanked again.
-# Nothing sounds or buzzes, and Wi-Fi and Bluetooth are left alone.
+#   4. reads two panel registers through debugfs (DCS reads): FFh, the
+#      command page the panel has selected, and 52h, its brightness when that
+#      page is 0;
+#   5. selects page 0 by hand, with FE 00 (the stock page select, the one the
+#      fix appends to boost mode out), and reads both again: on page 0, 52h is
+#      the brightness, whatever page boost mode out left. That's the only
+#      write to the panel.
+# PASS: page 00 and 52h equal to the LED level, before and after step 5.
+# Without the fix, step 4 finds the page boost mode out left (expected 70)
+# and step 5 finds the brightness stuck at ff. The user's brightness setting
+# ends as it was, and the screen is blanked again, which powers the panel
+# off: the next screen-on starts it afresh. Nothing sounds or buzzes, and
+# Wi-Fi and Bluetooth are left alone.
 set -u
 LED=/sys/class/leds/lcd-backlight/brightness
 HBM=/sys/class/graphics/fb0/hbm_mode
@@ -81,11 +84,15 @@ led=$(cat $LED) hbm=$(cat $HBM)
 log "back to $setting %: LED $led, hbm_mode $hbm"
 [ "$led" -lt 255 ] && [ "$hbm" = 0 ] || result "INCONCLUSIVE: the LED stayed at 255 or hbm_mode at 1"
 
-page=$(reg ff) b52=$(reg 52) led2=$(cat $LED)
+page=$(reg ff) b52=$(reg 52)
 want=$(printf '%02x' "$led")
-log "panel: page $page, 52h $b52; LED $led2 (0x$want)"
+log "panel as boost mode out left it: page $page, 52h $b52; LED $led (0x$want)"
+echo "fe 00" >"$DBG/panel_reg"
+page0=$(reg ff) b52p0=$(reg 52) led2=$(cat $LED)
+log "after FE 00 by hand: page $page0, 52h $b52p0; LED $led2"
 [ "$led2" = "$led" ] || result "INCONCLUSIVE: the LED moved during the reads ($led -> $led2)"
-if [ "$page" = 00 ] && [ "$b52" = "$want" ]; then
+[ "$page0" = 00 ] || result "INCONCLUSIVE: FE 00 by hand didn't select page 0 (page $page0)"
+if [ "$page" = 00 ] && [ "$b52" = "$want" ] && [ "$b52p0" = "$want" ]; then
 	result "PASS: boost mode out left page 00, and the panel took the brightness (52h $b52 = LED $led)"
 fi
-result "FAIL: page $page (want 00), 52h $b52 (want $want)"
+result "FAIL: boost mode out left page $page (want 00); the brightness on page 0 is $b52p0 (want $want)"
