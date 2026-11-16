@@ -23,11 +23,12 @@
 #      the brightness, whatever page boost mode out left. That's the only
 #      write to the panel.
 # PASS: page 00 and 52h equal to the LED level, before and after step 5.
-# Without the fix, step 4 finds the page boost mode out left (expected 70)
-# and step 5 finds the brightness stuck at ff. The user's brightness setting
-# ends as it was, and the screen is blanked again, which powers the panel
-# off: the next screen-on starts it afresh. Nothing sounds or buzzes, and
-# Wi-Fi and Bluetooth are left alone.
+# Measured 2026-11-16 at LED 76: build 025 (the fix) gave page 00 and 52h 4c
+# both times. Build 023 (no fix) gave page 70, 52h e4 (page 0x70's own
+# register), then 52h ff on page 0: the brightness stuck. The user's
+# brightness setting ends as it was, and the screen is blanked again, which
+# powers the panel off: the next screen-on starts it afresh. Nothing sounds or
+# buzzes, and Wi-Fi and Bluetooth are left alone.
 set -u
 LED=/sys/class/leds/lcd-backlight/brightness
 HBM=/sys/class/graphics/fb0/hbm_mode

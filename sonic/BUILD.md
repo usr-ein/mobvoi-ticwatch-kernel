@@ -389,13 +389,11 @@ Set `B` to the build directory, e.g. `B=~/Documents/sonic-screwdriver/build/kern
    since build 025. It runs on the watch, detached; the three commands are in
    its header. It sets brightness 100 % and back through mce, as the
    flashlight does, then reads the panel's selected page (FFh) and its
-   brightness (52h) through debugfs. It writes nothing to the panel. It must
-   end `RESULT: PASS`. Without the fix, 52h stays at ff: measured on
-   2026-11-16, read after selecting page 0 by hand. That the page then reads
-   70 is inferred, from the stock list (its last page select is `FE 70`) and
-   the datasheet (p.112). No unfixed kernel has run this script, and FFh has
-   only ever read 00 on this panel. So a PASS rests on 52h; the page read
-   only agrees with it.
+   brightness (52h) through debugfs. Then it selects page 0 by hand (`FE 00`,
+   its only write to the panel) and reads both again. It must end
+   `RESULT: PASS`, as build 025 did (page 00, 52h 4c at LED 76, both times).
+   Build 023, without the fix, gave `RESULT: FAIL` (2026-11-16 22:06): page
+   70 after boost mode out, and 52h stuck at ff on page 0.
 
 8. **Back to the normal kernel:** `ssh sonic-screwdriver systemctl reboot`
    (a plain reboot always boots `boot`). `recovery` keeps the trial image; it
