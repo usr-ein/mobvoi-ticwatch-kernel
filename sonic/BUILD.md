@@ -390,8 +390,12 @@ Set `B` to the build directory, e.g. `B=~/Documents/sonic-screwdriver/build/kern
    its header. It sets brightness 100 % and back through mce, as the
    flashlight does, then reads the panel's selected page (FFh) and its
    brightness (52h) through debugfs. It writes nothing to the panel. It must
-   end `RESULT: PASS`. Without the fix, the page reads 70 and the brightness
-   stays at ff.
+   end `RESULT: PASS`. Without the fix, 52h stays at ff: measured on
+   2026-11-16, read after selecting page 0 by hand. That the page then reads
+   70 is inferred, from the stock list (its last page select is `FE 70`) and
+   the datasheet (p.112). No unfixed kernel has run this script, and FFh has
+   only ever read 00 on this panel. So a PASS rests on 52h; the page read
+   only agrees with it.
 
 8. **Back to the normal kernel:** `ssh sonic-screwdriver systemctl reboot`
    (a plain reboot always boots `boot`). `recovery` keeps the trial image; it

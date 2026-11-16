@@ -18,10 +18,13 @@
 #   4. reads two panel registers through debugfs (DCS reads, nothing written
 #      to the panel): FFh, the command page the panel has selected, and 52h,
 #      its brightness.
-# PASS: page 00 and 52h equal to the LED level. Without the fix, boost mode
-# out leaves page 70 selected and the brightness stuck at ff. The user's
-# brightness setting ends as it was, and the screen is blanked again. Nothing
-# sounds or buzzes, and Wi-Fi and Bluetooth are left alone.
+# PASS: page 00 and 52h equal to the LED level. Without the fix, 52h stays
+# stuck at ff (measured 2026-11-16, read after selecting page 0 by hand).
+# That boost mode out then leaves page 70 selected is inferred, from the
+# stock list and the datasheet (p.112): no unfixed kernel has run this script,
+# and FFh has only ever read 00 on this panel. So a PASS rests on 52h. The
+# user's brightness setting ends as it was, and the screen is blanked again.
+# Nothing sounds or buzzes, and Wi-Fi and Bluetooth are left alone.
 set -u
 LED=/sys/class/leds/lcd-backlight/brightness
 HBM=/sys/class/graphics/fb0/hbm_mode
