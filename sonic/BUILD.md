@@ -24,7 +24,8 @@ Read these before touching the watch.
   any other partition from a script. `boot` holds a known-good kernel, i.e.
   one listed in `sonic/known-good-boot.sha256`: the AsteroidOS 2.1 release, or
   a kernel made permanent since (build 022 on 2026-10-31, build 023 with SysV
-  IPC on 2026-11-01). It is what the watch falls back
+  IPC on 2026-11-01, build 025 with the boost-mode-out fix on 2026-11-16). It
+  is what the watch falls back
   to, and `flash-recovery.sh` refuses to write a trial unless `boot` holds one
   of them. Writing `boot` is a deliberate manual step, only with the user's OK
   (see "Making a kernel permanent").
@@ -414,7 +415,7 @@ check and writes nothing.
 
 ## Making a kernel permanent
 
-Done twice, each time with the user's explicit OK:
+Done three times, each time with the user's explicit OK:
 
 - **Build 022** on 2026-10-31, after 16 h on trial with no oops, no new warnings
   and no touch or I2C errors.
@@ -422,6 +423,16 @@ Done twice, each time with the user's explicit OK:
   trial with the same result. Step 3's reboot was left to the user. Step 5
   came before step 4: once the known-good list names the new image,
   `flash-recovery.sh --fallback` checks that `boot` holds it.
+- **Build 025** (the panel's boost mode out ends on the user page) on
+  2026-11-16, right after both PRs merged, as the user chose ("Right after").
+  - Before that: two trial boots from `recovery`, the panel check passing on
+    both (`panel-page-check.sh`), and failing on 023 as the control. The user
+    also tested the flashlight by eye on both kernels.
+  - The steps ran in order. Step 3's plain boot (22:37) gave `#25-2b0e77c`
+    with no `sonic.trial=1`, and `trial-check.sh` was healthy. The fix's boot
+    line was there, `sonic-audio` was active, and `semtest` passed.
+  - So `flash-recovery.sh --fallback` (step 4) only warned that `boot` held an
+    unlisted image, until this list named it (step 5).
 
 The steps, all by hand:
 
