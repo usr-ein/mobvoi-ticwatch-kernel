@@ -97,6 +97,7 @@
 			15 01 00 00 00 00 02 66 00
 			15 01 00 00 00 00 02 FE 70
 			15 01 00 00 00 00 02 66 47
+			15 01 00 00 00 00 02 FE 00 /* back to the user page */
 			];
 		qcom,mdss-dsi-boost-mode-in-command-state = "dsi_lp_mode";
 		qcom,mdss-dsi-boost-mode-out-command-state = "dsi_hs_mode";
