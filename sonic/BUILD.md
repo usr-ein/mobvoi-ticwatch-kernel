@@ -437,13 +437,32 @@ Done four times, each time with the user's explicit OK:
 - **Build 029** (own-address advertising on the vendor set: fixes 1 and 2,
   P-049) on 2026-11-17, from `asteroidos-2.1` at 5684bf25, right after #12
   merged, as the user chose ("Normal now"), over a day-long trial first.
-  - Before that: trial boots of 027 and 028 from `recovery`, the same code
-    (5684bf25's tree is 028's e7f757e); config and `Module.symvers` identical
-    to 025's.
+  - Before that: trial boot 028 from `recovery`, of the same tree (5684bf25's
+    is e7f757e's; 027 lacked 408b28d, the set switched off at power off);
+    config and `Module.symvers` identical to 025's.
   - The steps ran in order, `recovery` keeping the 2.1 release. Step 3's plain
     boot (21:10) gave `#29-5684bf2` with no `sonic.trial=1`; `trial-check.sh`
-    was healthy, `semtest` passed, `klog-compare.py --window 90` against 025
-    showed only the known differences, and `own-adv-check` passed.
+    was healthy, `semtest` passed, and `klog-compare.py --window 90` against
+    025 showed only the known differences.
+  - `own-adv-check` at 21:12 missed #12's round-2 case: the iPhone was back
+    727 ms before step 7's update. At 21:32, with the iPhone's Bluetooth off,
+    it captured it (btmon, the iPhone's link down from 21:32:30):
+    ```
+    21:32:59.971619 < LE Set Advertising Enable 01           power on: the standard set, no link
+    21:33:00.034640 < Vendor 01, 04, 02, 05 01 01            the vendor set added again beside it
+    21:33:00.659470 < Vendor 05 00 01, 01, 04, 02, 05 01 01  step 7's update, each answered 0x00
+    21:35:13.835753 < Vendor 05 00 01                        the final removal, answered 0x00
+    21:38:40.950181 > LE Connection Complete                 the iPhone
+    21:38:40.960057 > Vendor event 55 00 00 40 00            handle 0, ended by that connection
+    21:38:47         ioslink: ancs: subscribed
+    ```
+    Between 21:33:00.676 and 21:38:40.950 the only HCI traffic is the
+    removal's `05 00 01` and its answer: the standard set stayed on air
+    after the vendor set was switched off, with nothing to restart it. Its
+    RESULT read FAIL only because the iPhone came back after its 120 s.
+  - The rollback, had it failed: 025's `boot-final.img` (6cc98f14…, kept on
+    the Mac) written to `boot` by step 2; the 2.1 release already in
+    `recovery`.
 
 The steps, all by hand:
 

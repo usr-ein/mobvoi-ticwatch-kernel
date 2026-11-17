@@ -30,19 +30,30 @@
  *   7. Power off with the set on: the kernel switches it off (btmon: the
  *      0xfd54 disable, answered 0x00, before hci0 closes), forgets it and
  *      says so (Advertising Removed); after power on it's added again, as
- *      ioslink does (haystack.go, poweredChanged). Then, before the iPhone
- *      is back (2.5 s in trial 028), it's updated in place: the vendor set
- *      switched off while ioslink's connectable advertisement is on air on
- *      the standard set, as at a key change while the iPhone is away (fork
- *      PR #12, round 2's note 2). btmon must show 05 00 01 and the four
- *      commands, each answered 0x00, and no 0x55 for handle 0 before the
- *      iPhone's LE Connection Complete.
+ *      ioslink does (haystack.go, poweredChanged). Then it's updated in
+ *      place after power on: if no iPhone is connected before and after the
+ *      update (mgmt Get Connections, the kernel's own count), this is the
+ *      case fork PR #12's round 2 asked for (its note 2), the vendor set
+ *      switched off while only the standard set advertises, as at a key
+ *      change while the iPhone is away. The check says on a line of its own
+ *      whether it captured it; btmon decides whether it passed:
+ *        - the standard set's LE Set Advertising Enable, answered 0x00, comes
+ *          before the vendor set's 05 00 01;
+ *        - every vendor command is answered 0x00;
+ *        - from that 05 00 01 until the iPhone's LE Connection Complete, no
+ *          command goes to the standard set (0x2005 to 0x200a);
+ *        - 0x55 for handle 0 follows that connection, then ioslink logs
+ *          "ancs: subscribed".
+ *      With the iPhone in range it reconnects within milliseconds of the
+ *      standard set coming on, so the case needs its Bluetooth off. Steps 5
+ *      and 6 never count: step 7's power on starts the standard set again.
  *   8. With the set on, the iPhone's link dropped from the watch: the vendor
  *      set is updated in place after the drop, and the iPhone comes back by
- *      itself (Sonic's pending connect). Whether the standard set was on air
- *      at the update is btmon's to show: in trial 028 the iPhone was back
- *      6 ms after the drop. Then the set is removed. btmon and ioslink's
- *      journal show the rest.
+ *      itself (Sonic's pending connect). Then the set is removed. If no
+ *      iPhone comes back within 120 s, step 8 doesn't run, which the RESULT
+ *      line says. btmon and ioslink's journal show the rest.
+ * RESULT: PASS only when every check passed, the case was captured and step 8
+ * ran; FAIL when a check failed; INCOMPLETE, with what's missing, otherwise.
  * The iPhone's address is never printed.
  */
 #include <errno.h>
@@ -62,6 +73,7 @@
 #define OP_READ_ADV_FEATURES 0x003d
 #define OP_ADD_ADVERTISING 0x003e
 #define OP_REMOVE_ADVERTISING 0x003f
+#define OP_GET_CONNECTIONS 0x0015
 #define EV_CMD_COMPLETE 0x0001
 #define EV_CMD_STATUS 0x0002
 #define EV_ADV_REMOVED 0x0024
@@ -200,6 +212,19 @@ static int wait_event(uint16_t ev, int instance, int seconds)
 	return 0;
 }
 
+/* The kernel's own count of connections on hci0 (mgmt Get Connections), or -1
+ * when it didn't answer: a failure never reads as "away".
+ */
+static int connections(void)
+{
+	uint8_t rp[256];
+	int len = sizeof(rp);
+
+	if (command(OP_GET_CONNECTIONS, NULL, 0, rp, &len) != 0 || len < 2)
+		return -1;
+	return get16(rp);
+}
+
 /* The connected device's address, from bluetoothctl, or "" for none: the iPhone's. */
 static void connected(char *out, size_t size)
 {
@@ -283,7 +308,7 @@ int main(int argc, char **argv)
 	check(features(&flags, INSTANCE) == 0, "6. gone from the list");
 
 	char phone[32];
-	int status = -1, secs, away;
+	int status = -1, secs, before, after, captured, step8 = 0;
 
 	check(add(INSTANCE, FLAG_SONIC_OWN_ADDR, 31, 0, a1) == 0, "7. added again: C0:FF:EE:00:00:01");
 	sleep(3);
@@ -300,17 +325,22 @@ int main(int argc, char **argv)
 	check(status == 0, "7. power on: added again, as ioslink does");
 	check(features(&flags, INSTANCE) == 1, "7. power on: listed");
 	usleep(500000);	/* the standard set back on air first */
-	connected(phone, sizeof(phone));
-	away = !phone[0];
+	before = connections();
 	check(add(INSTANCE, FLAG_SONIC_OWN_ADDR, 31, 0, a2) == 0,
-	      "7. updated in place before the iPhone is back: C0:FF:EE:00:00:02");
-	printf("own-adv-check: the iPhone was %s just before the update\n",
-	       away ? "away" : "already back, so btmon decides");
+	      "7. updated in place after power on: C0:FF:EE:00:00:02");
+	after = connections();
+	captured = before == 0 && after == 0;
+	printf("own-adv-check: the case, the vendor set switched off while only the standard set advertises: %s\n",
+	       captured ? "captured (btmon decides)" :
+	       before < 0 || after < 0 ? "NOT CAPTURED: the kernel didn't give its connections" :
+	       "NOT CAPTURED: a link was up at the update");
+	fflush(stdout);
 
 	secs = until_connected(120, phone, sizeof(phone));
-	printf("own-adv-check: the iPhone %s\n", secs < 0 ? "didn't come back in 120 s" : "is connected");
-	check(secs >= 0, "8. the iPhone is connected, before the drop");
+	printf("own-adv-check: the iPhone %s\n", secs < 0 ? "didn't come back in 120 s: no step 8" : "is connected");
+	fflush(stdout);
 	if (secs >= 0) {
+		step8 = 1;
 		char cmd[96];
 
 		snprintf(cmd, sizeof(cmd), "bluetoothctl disconnect %s >/dev/null", phone);
@@ -326,6 +356,12 @@ int main(int argc, char **argv)
 	}
 	check(removal(INSTANCE) == 0, "8. removed");
 
-	printf("own-adv-check: RESULT: %s\n", fails ? "FAIL" : "PASS");
-	return fails ? 1 : 0;
+	if (fails)
+		printf("own-adv-check: RESULT: FAIL: %d checks\n", fails);
+	else if (!captured || !step8)
+		printf("own-adv-check: RESULT: INCOMPLETE:%s%s\n", captured ? "" : " the case not captured;",
+		       step8 ? "" : " no step 8 (no iPhone within 120 s)");
+	else
+		printf("own-adv-check: RESULT: PASS (the case: btmon decides)\n");
+	return fails ? 1 : captured && step8 ? 0 : 3;
 }
