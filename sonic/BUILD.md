@@ -24,7 +24,8 @@ Read these before touching the watch.
   any other partition from a script. `boot` holds a known-good kernel, i.e.
   one listed in `sonic/known-good-boot.sha256`: the AsteroidOS 2.1 release, or
   a kernel made permanent since (build 022 on 2026-10-31, build 023 with SysV
-  IPC on 2026-11-01, build 025 with the boost-mode-out fix on 2026-11-16). It
+  IPC on 2026-11-01, build 025 with the boost-mode-out fix on 2026-11-16, build
+  029 with own-address advertising on 2026-11-17). It
   is what the watch falls back
   to, and `flash-recovery.sh` refuses to write a trial unless `boot` holds one
   of them. Writing `boot` is a deliberate manual step, only with the user's OK
@@ -415,7 +416,7 @@ check and writes nothing.
 
 ## Making a kernel permanent
 
-Done three times, each time with the user's explicit OK:
+Done four times, each time with the user's explicit OK:
 
 - **Build 022** on 2026-10-31, after 16 h on trial with no oops, no new warnings
   and no touch or I2C errors.
@@ -433,6 +434,16 @@ Done three times, each time with the user's explicit OK:
     line was there, `sonic-audio` was active, and `semtest` passed.
   - So `flash-recovery.sh --fallback` (step 4) only warned that `boot` held an
     unlisted image, until this list named it (step 5).
+- **Build 029** (own-address advertising on the vendor set: fixes 1 and 2,
+  P-049) on 2026-11-17, from `asteroidos-2.1` at 5684bf25, right after #12
+  merged, as the user chose ("Normal now"), over a day-long trial first.
+  - Before that: trial boots of 027 and 028 from `recovery`, the same code
+    (5684bf25's tree is 028's e7f757e); config and `Module.symvers` identical
+    to 025's.
+  - The steps ran in order, `recovery` keeping the 2.1 release. Step 3's plain
+    boot (21:10) gave `#29-5684bf2` with no `sonic.trial=1`; `trial-check.sh`
+    was healthy, `semtest` passed, `klog-compare.py --window 90` against 025
+    showed only the known differences, and `own-adv-check` passed.
 
 The steps, all by hand:
 
