@@ -561,6 +561,12 @@ struct mgmt_rp_add_advertising {
 #define MGMT_ADV_FLAG_TX_POWER		BIT(4)
 #define MGMT_ADV_FLAG_APPEARANCE	BIT(5)
 #define MGMT_ADV_FLAG_LOCAL_NAME	BIT(6)
+/* Sonic Screwdriver (P-049): an advertisement from an address of its own,
+ * sent non-connectable and verbatim on the controller's vendor set (Broadcom's
+ * multi-advertising, handle 1), beside the standard set. The 6 address bytes
+ * follow the scan response data. A private flag, far from upstream's.
+ */
+#define MGMT_ADV_FLAG_SONIC_OWN_ADDR	BIT(31)
 
 #define MGMT_OP_REMOVE_ADVERTISING	0x003F
 struct mgmt_cp_remove_advertising {

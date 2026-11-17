@@ -1335,6 +1335,47 @@ struct hci_cp_le_set_scan_rsp_data {
 
 #define HCI_OP_LE_SET_ADV_ENABLE	0x200a
 
+/* Broadcom's vendor multi-advertising, as Android drives it (AOSP
+ * stack/include/hcidefs.h, stack/btm/ble_advertiser_hci_interface.cc): one
+ * opcode, a sub-command first, a handle last. Each answers status and sub.
+ * Handle 0 is the standard set; P-049 uses handle 1 (MGMT_ADV_FLAG_SONIC_OWN_ADDR).
+ */
+#define HCI_OP_BCM_LE_MULTI_ADV		0xfd54
+#define BCM_MULTI_ADV_SET_PARAM		0x01
+#define BCM_MULTI_ADV_WRITE_ADV_DATA	0x02
+#define BCM_MULTI_ADV_SET_RANDOM_ADDR	0x04
+#define BCM_MULTI_ADV_ENABLE		0x05
+struct bcm_multi_adv_param {
+	__u8	sub;
+	__le16	min_interval;
+	__le16	max_interval;
+	__u8	type;
+	__u8	own_addr_type;
+	bdaddr_t own_addr;
+	__u8	peer_addr_type;
+	bdaddr_t peer_addr;
+	__u8	channel_map;
+	__u8	filter_policy;
+	__u8	handle;
+	__s8	tx_power;
+} __packed;
+struct bcm_multi_adv_data {
+	__u8	sub;
+	__u8	len;
+	__u8	data[HCI_MAX_AD_LENGTH];
+	__u8	handle;
+} __packed;
+struct bcm_multi_adv_random_addr {
+	__u8	sub;
+	bdaddr_t addr;
+	__u8	handle;
+} __packed;
+struct bcm_multi_adv_enable {
+	__u8	sub;
+	__u8	enable;
+	__u8	handle;
+} __packed;
+
 #define LE_SCAN_PASSIVE			0x00
 #define LE_SCAN_ACTIVE			0x01
 

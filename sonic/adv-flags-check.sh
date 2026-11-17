@@ -19,7 +19,7 @@
 set -u
 want=${1:?usage: adv-flags-check.sh <uname -v prefix, e.g. "#26-fa379e1">}
 case "$(uname -v)" in
-"$want"*) ;;
+"$want "*) ;; # the whole build tag: #26-fa379e1 must not match #26-fa379e10
 *) echo "adv-flags-check: refusing: this kernel is $(uname -v), not $want"; exit 2 ;;
 esac
 echo "adv-flags-check 120000000000" >/sys/power/wake_lock

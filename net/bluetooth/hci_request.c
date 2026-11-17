@@ -969,6 +969,60 @@ void __hci_req_enable_advertising(struct hci_request *req)
 	hci_req_add(req, HCI_OP_LE_SET_ADV_ENABLE, sizeof(enable), &enable);
 }
 
+/* Sonic Screwdriver (P-049): the controller's vendor set, handle 1, beside the
+ * standard set that the rest of this file drives, so that the standard set's
+ * advertising never pauses for it. Non-connectable, from its own random
+ * address, its data verbatim, every 1 to 2 s (OpenHaystack's interval). Only
+ * Add Advertising with MGMT_ADV_FLAG_SONIC_OWN_ADDR gets here (mgmt.c).
+ */
+#define SONIC_ADV_HANDLE	0x01
+#define SONIC_ADV_MIN_INTERVAL	0x0640
+#define SONIC_ADV_MAX_INTERVAL	0x0c80
+#define SONIC_ADV_TX_POWER	1	/* dBm, Android's "high" */
+
+void __hci_req_sonic_adv(struct hci_request *req, bool enable,
+			 const bdaddr_t *addr, const u8 *data, u8 len)
+{
+	struct bcm_multi_adv_enable en;
+
+	if (enable) {
+		struct bcm_multi_adv_param param;
+		struct bcm_multi_adv_random_addr ra;
+		struct bcm_multi_adv_data ad;
+
+		memset(&param, 0, sizeof(param));
+		param.sub = BCM_MULTI_ADV_SET_PARAM;
+		param.min_interval = cpu_to_le16(SONIC_ADV_MIN_INTERVAL);
+		param.max_interval = cpu_to_le16(SONIC_ADV_MAX_INTERVAL);
+		param.type = LE_ADV_NONCONN_IND;
+		param.own_addr_type = ADDR_LE_DEV_RANDOM;
+		bacpy(&param.own_addr, addr);
+		param.channel_map = 0x07;
+		param.handle = SONIC_ADV_HANDLE;
+		param.tx_power = SONIC_ADV_TX_POWER;
+		hci_req_add(req, HCI_OP_BCM_LE_MULTI_ADV, sizeof(param), &param);
+
+		memset(&ra, 0, sizeof(ra));
+		ra.sub = BCM_MULTI_ADV_SET_RANDOM_ADDR;
+		bacpy(&ra.addr, addr);
+		ra.handle = SONIC_ADV_HANDLE;
+		hci_req_add(req, HCI_OP_BCM_LE_MULTI_ADV, sizeof(ra), &ra);
+
+		memset(&ad, 0, sizeof(ad));
+		ad.sub = BCM_MULTI_ADV_WRITE_ADV_DATA;
+		ad.len = min_t(u8, len, HCI_MAX_AD_LENGTH);
+		memcpy(ad.data, data, ad.len);
+		ad.handle = SONIC_ADV_HANDLE;
+		hci_req_add(req, HCI_OP_BCM_LE_MULTI_ADV, sizeof(ad), &ad);
+	}
+
+	memset(&en, 0, sizeof(en));
+	en.sub = BCM_MULTI_ADV_ENABLE;
+	en.enable = enable ? 0x01 : 0x00;
+	en.handle = SONIC_ADV_HANDLE;
+	hci_req_add(req, HCI_OP_BCM_LE_MULTI_ADV, sizeof(en), &en);
+}
+
 u8 append_local_name(struct hci_dev *hdev, u8 *ptr, u8 ad_len)
 {
 	size_t short_len;

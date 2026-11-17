@@ -992,6 +992,8 @@ static void cancel_adv_timeout(struct hci_dev *hdev)
 	}
 }
 
+static bool sonic_adv_is(struct hci_dev *hdev, u8 instance);
+
 static int clean_up_hci_state(struct hci_dev *hdev)
 {
 	struct hci_request req;
@@ -1018,6 +1020,15 @@ static int clean_up_hci_state(struct hci_dev *hdev)
 		/* 0x15 == Terminated due to Power Off */
 		__hci_abort_conn(&req, conn, 0x15);
 	}
+
+	/* P-049: the vendor set too, and last, so that a refusal can't keep the
+	 * commands above from going (it ends the request). A power off resets
+	 * nothing on this watch: hci0 is bluebinder's vhci, with no
+	 * HCI_QUIRK_RESET_ON_CLOSE and no shutdown, so the set would stay on
+	 * air. __mgmt_power_off() then forgets it.
+	 */
+	if (sonic_adv_is(hdev, 0))
+		__hci_req_sonic_adv(&req, false, NULL, NULL, 0);
 
 	err = hci_req_run(&req, clean_up_hci_complete);
 	if (!err && discov_stopped)
@@ -5948,6 +5959,48 @@ done:
 	return err;
 }
 
+/* Sonic Screwdriver (P-049): the one advertisement with an address of its
+ * own (MGMT_ADV_FLAG_SONIC_OWN_ADDR), on the controller's vendor set
+ * (__hci_req_sonic_adv). It is kept apart from hdev->adv_instances, so that
+ * the standard set's rotation never sees it, and so that struct hci_dev keeps
+ * its layout (the exported symbols' CRCs). One adapter at a time: the watch
+ * has one. Read and written under that adapter's hci_dev_lock.
+ */
+static struct {
+	bool		active;
+	u16		index;		/* hdev->id */
+	u8		instance;
+} sonic_adv;
+
+/* Broadcom's controllers have the vendor sets (P-049 read the watch's
+ * BCM43430A1: LE Get Vendor Capabilities, adv_inst_max 5). A controller
+ * without them refuses the commands, and Add Advertising fails cleanly.
+ */
+static bool sonic_adv_supported(struct hci_dev *hdev)
+{
+	return hdev->manufacturer == 15 && lmp_le_capable(hdev);
+}
+
+static bool sonic_adv_is(struct hci_dev *hdev, u8 instance)
+{
+	return sonic_adv.active && sonic_adv.index == hdev->id &&
+	       (!instance || sonic_adv.instance == instance);
+}
+
+/* Forget the vendor set's advertisement and say so; with req, also switch the
+ * set off. Without, at power off, clean_up_hci_state() has switched it off.
+ */
+static void sonic_adv_clear(struct hci_dev *hdev, struct sock *sk,
+			    struct hci_request *req)
+{
+	if (!sonic_adv_is(hdev, 0))
+		return;
+	if (req)
+		__hci_req_sonic_adv(req, false, NULL, NULL, 0);
+	sonic_adv.active = false;
+	mgmt_advertising_removed(sk, hdev, sonic_adv.instance);
+}
+
 static u32 get_supported_adv_flags(struct hci_dev *hdev)
 {
 	u32 flags = 0;
@@ -5961,6 +6014,9 @@ static u32 get_supported_adv_flags(struct hci_dev *hdev)
 
 	if (hdev->adv_tx_power != HCI_TX_POWER_INVALID)
 		flags |= MGMT_ADV_FLAG_TX_POWER;
+
+	if (sonic_adv_supported(hdev))
+		flags |= MGMT_ADV_FLAG_SONIC_OWN_ADDR;
 
 	return flags;
 }
@@ -5983,7 +6039,7 @@ static int read_adv_features(struct sock *sk, struct hci_dev *hdev,
 
 	hci_dev_lock(hdev);
 
-	rp_len = sizeof(*rp) + hdev->adv_instance_cnt;
+	rp_len = sizeof(*rp) + hdev->adv_instance_cnt + sonic_adv_is(hdev, 0);
 	rp = kmalloc(rp_len, GFP_ATOMIC);
 	if (!rp) {
 		hci_dev_unlock(hdev);
@@ -5996,13 +6052,15 @@ static int read_adv_features(struct sock *sk, struct hci_dev *hdev,
 	rp->max_adv_data_len = HCI_MAX_AD_LENGTH;
 	rp->max_scan_rsp_len = HCI_MAX_AD_LENGTH;
 	rp->max_instances = HCI_MAX_ADV_INSTANCES;
-	rp->num_instances = hdev->adv_instance_cnt;
+	rp->num_instances = hdev->adv_instance_cnt + sonic_adv_is(hdev, 0);
 
 	instance = rp->instance;
 	list_for_each_entry(adv_instance, &hdev->adv_instances, list) {
 		*instance = adv_instance->instance;
 		instance++;
 	}
+	if (sonic_adv_is(hdev, 0))
+		*instance = sonic_adv.instance;
 
 	hci_dev_unlock(hdev);
 
@@ -6172,6 +6230,126 @@ unlock:
 	hci_dev_unlock(hdev);
 }
 
+static void sonic_add_complete(struct hci_dev *hdev, u8 status, u16 opcode)
+{
+	struct mgmt_pending_cmd *cmd;
+	struct mgmt_cp_add_advertising *cp;
+	struct mgmt_rp_add_advertising rp;
+
+	BT_DBG("status %d", status);
+
+	hci_dev_lock(hdev);
+
+	cmd = pending_find(MGMT_OP_ADD_ADVERTISING, hdev);
+	if (!cmd)
+		goto unlock;
+	cp = cmd->param;
+
+	if (status) {
+		/* A failed update may have left the set off: forget it. */
+		sonic_adv_clear(hdev, NULL, NULL);
+		mgmt_cmd_status(cmd->sk, cmd->index, cmd->opcode,
+				mgmt_status(status));
+	} else {
+		if (!sonic_adv_is(hdev, cp->instance))
+			mgmt_advertising_added(cmd->sk, hdev, cp->instance);
+		sonic_adv.active = true;
+		sonic_adv.index = hdev->id;
+		sonic_adv.instance = cp->instance;
+		rp.instance = cp->instance;
+		mgmt_cmd_complete(cmd->sk, cmd->index, cmd->opcode,
+				  MGMT_STATUS_SUCCESS, &rp, sizeof(rp));
+	}
+
+	mgmt_pending_remove(cmd);
+
+unlock:
+	hci_dev_unlock(hdev);
+}
+
+/* Add Advertising with MGMT_ADV_FLAG_SONIC_OWN_ADDR (P-049): the data alone,
+ * then the 6-byte static random address; sent verbatim, non-connectable, on
+ * the vendor set. Adding it again under its instance updates it in place.
+ */
+static int sonic_add_advertising(struct sock *sk, struct hci_dev *hdev,
+				 struct mgmt_cp_add_advertising *cp,
+				 u16 data_len)
+{
+	struct mgmt_pending_cmd *cmd;
+	struct hci_request req;
+	bdaddr_t addr;
+	bool update;
+	u8 status;
+	int i, cur_len, err;
+
+	if (!sonic_adv_supported(hdev))
+		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_ADD_ADVERTISING,
+				       MGMT_STATUS_NOT_SUPPORTED);
+
+	if (__le32_to_cpu(cp->flags) != MGMT_ADV_FLAG_SONIC_OWN_ADDR ||
+	    cp->scan_rsp_len || cp->timeout ||
+	    cp->adv_data_len > HCI_MAX_AD_LENGTH ||
+	    data_len != sizeof(*cp) + cp->adv_data_len + sizeof(addr))
+		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_ADD_ADVERTISING,
+				       MGMT_STATUS_INVALID_PARAMS);
+
+	for (i = 0, cur_len = 0; i < cp->adv_data_len; i += (cur_len + 1)) {
+		cur_len = cp->data[i];
+		if (i + cur_len >= cp->adv_data_len)
+			return mgmt_cmd_status(sk, hdev->id,
+					       MGMT_OP_ADD_ADVERTISING,
+					       MGMT_STATUS_INVALID_PARAMS);
+	}
+
+	/* A static random address: the two top bits set, not all ones. */
+	memcpy(&addr, cp->data + cp->adv_data_len, sizeof(addr));
+	if ((addr.b[5] & 0xc0) != 0xc0 || !bacmp(&addr, BDADDR_NONE))
+		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_ADD_ADVERTISING,
+				       MGMT_STATUS_INVALID_PARAMS);
+
+	hci_dev_lock(hdev);
+
+	if (!hdev_is_powered(hdev)) {
+		status = MGMT_STATUS_REJECTED;
+		goto refuse;
+	}
+
+	/* Its instance can't be a standard one's, and one at a time. */
+	if (hci_find_adv_instance(hdev, cp->instance) ||
+	    (sonic_adv.active && !sonic_adv_is(hdev, cp->instance)) ||
+	    pending_find(MGMT_OP_ADD_ADVERTISING, hdev) ||
+	    pending_find(MGMT_OP_REMOVE_ADVERTISING, hdev) ||
+	    pending_find(MGMT_OP_SET_LE, hdev)) {
+		status = MGMT_STATUS_BUSY;
+		goto refuse;
+	}
+
+	update = sonic_adv_is(hdev, cp->instance);
+
+	cmd = mgmt_pending_add(sk, MGMT_OP_ADD_ADVERTISING, hdev, cp,
+			       data_len);
+	if (!cmd) {
+		err = -ENOMEM;
+		goto unlock;
+	}
+
+	hci_req_init(&req, hdev);
+	if (update)
+		__hci_req_sonic_adv(&req, false, NULL, NULL, 0);
+	__hci_req_sonic_adv(&req, true, &addr, cp->data, cp->adv_data_len);
+
+	err = hci_req_run(&req, sonic_add_complete);
+	if (err < 0)
+		mgmt_pending_remove(cmd);
+	goto unlock;
+
+refuse:
+	err = mgmt_cmd_status(sk, hdev->id, MGMT_OP_ADD_ADVERTISING, status);
+unlock:
+	hci_dev_unlock(hdev);
+	return err;
+}
+
 static int add_advertising(struct sock *sk, struct hci_dev *hdev,
 			   void *data, u16 data_len)
 {
@@ -6199,6 +6377,9 @@ static int add_advertising(struct sock *sk, struct hci_dev *hdev,
 		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_ADD_ADVERTISING,
 				       MGMT_STATUS_INVALID_PARAMS);
 
+	if (__le32_to_cpu(cp->flags) & MGMT_ADV_FLAG_SONIC_OWN_ADDR)
+		return sonic_add_advertising(sk, hdev, cp, data_len);
+
 	if (data_len != sizeof(*cp) + cp->adv_data_len + cp->scan_rsp_len)
 		return mgmt_cmd_status(sk, hdev->id, MGMT_OP_ADD_ADVERTISING,
 				       MGMT_STATUS_INVALID_PARAMS);
@@ -6220,6 +6401,13 @@ static int add_advertising(struct sock *sk, struct hci_dev *hdev,
 	if (timeout && !hdev_is_powered(hdev)) {
 		err = mgmt_cmd_status(sk, hdev->id, MGMT_OP_ADD_ADVERTISING,
 				      MGMT_STATUS_REJECTED);
+		goto unlock;
+	}
+
+	/* The vendor set holds this instance number (P-049). */
+	if (sonic_adv_is(hdev, cp->instance)) {
+		err = mgmt_cmd_status(sk, hdev->id, MGMT_OP_ADD_ADVERTISING,
+				      MGMT_STATUS_BUSY);
 		goto unlock;
 	}
 
@@ -6356,7 +6544,8 @@ static int remove_advertising(struct sock *sk, struct hci_dev *hdev,
 
 	hci_dev_lock(hdev);
 
-	if (cp->instance && !hci_find_adv_instance(hdev, cp->instance)) {
+	if (cp->instance && !hci_find_adv_instance(hdev, cp->instance) &&
+	    !sonic_adv_is(hdev, cp->instance)) {
 		err = mgmt_cmd_status(sk, hdev->id,
 				      MGMT_OP_REMOVE_ADVERTISING,
 				      MGMT_STATUS_INVALID_PARAMS);
@@ -6369,6 +6558,24 @@ static int remove_advertising(struct sock *sk, struct hci_dev *hdev,
 		err = mgmt_cmd_status(sk, hdev->id, MGMT_OP_REMOVE_ADVERTISING,
 				      MGMT_STATUS_BUSY);
 		goto unlock;
+	}
+
+	/* The vendor set's (P-049): off at once, answered at once. Instance 0
+	 * (all of them) takes it too, then goes on to the standard ones.
+	 */
+	if (sonic_adv_is(hdev, cp->instance)) {
+		hci_req_init(&req, hdev);
+		sonic_adv_clear(hdev, sk, hdev_is_powered(hdev) ? &req : NULL);
+		if (!skb_queue_empty(&req.cmd_q))
+			hci_req_run(&req, NULL);
+		if (cp->instance || list_empty(&hdev->adv_instances)) {
+			rp.instance = cp->instance;
+			err = mgmt_cmd_complete(sk, hdev->id,
+						MGMT_OP_REMOVE_ADVERTISING,
+						MGMT_STATUS_SUCCESS, &rp,
+						sizeof(rp));
+			goto unlock;
+		}
 	}
 
 	if (list_empty(&hdev->adv_instances)) {
@@ -6683,6 +6890,13 @@ void __mgmt_power_off(struct hci_dev *hdev)
 		status = MGMT_STATUS_NOT_POWERED;
 
 	mgmt_pending_foreach(0, hdev, cmd_complete_rsp, &status);
+
+	/* P-049: clean_up_hci_state() switched the vendor set off; forget it,
+	 * with Advertising Removed. BlueZ 5.79 doesn't add it again: its user,
+	 * ioslink, takes it back at power off and registers it again at power on
+	 * (sonic-screwdriver ioslink/haystack.go, poweredChanged).
+	 */
+	sonic_adv_clear(hdev, NULL, NULL);
 
 	if (memcmp(hdev->dev_class, zero_cod, sizeof(zero_cod)) != 0) {
 		mgmt_limited_event(MGMT_EV_CLASS_OF_DEV_CHANGED, hdev,
