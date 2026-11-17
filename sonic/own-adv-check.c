@@ -30,12 +30,19 @@
  *   7. Power off with the set on: the kernel switches it off (btmon: the
  *      0xfd54 disable, answered 0x00, before hci0 closes), forgets it and
  *      says so (Advertising Removed); after power on it's added again, as
- *      ioslink does (haystack.go, poweredChanged).
- *   8. With the set on, the iPhone's link dropped from the watch: ioslink's
- *      connectable advertisement goes on air on the standard set beside the
- *      vendor set, the vendor set is updated in place meanwhile (lost mode's
- *      order), and the iPhone comes back by itself (Sonic's pending connect).
- *      Then the set is removed. btmon and ioslink's journal show the rest.
+ *      ioslink does (haystack.go, poweredChanged). Then, before the iPhone
+ *      is back (2.5 s in trial 028), it's updated in place: the vendor set
+ *      switched off while ioslink's connectable advertisement is on air on
+ *      the standard set, as at a key change while the iPhone is away (fork
+ *      PR #12, round 2's note 2). btmon must show 05 00 01 and the four
+ *      commands, each answered 0x00, and no 0x55 for handle 0 before the
+ *      iPhone's LE Connection Complete.
+ *   8. With the set on, the iPhone's link dropped from the watch: the vendor
+ *      set is updated in place after the drop, and the iPhone comes back by
+ *      itself (Sonic's pending connect). Whether the standard set was on air
+ *      at the update is btmon's to show: in trial 028 the iPhone was back
+ *      6 ms after the drop. Then the set is removed. btmon and ioslink's
+ *      journal show the rest.
  * The iPhone's address is never printed.
  */
 #include <errno.h>
@@ -276,7 +283,7 @@ int main(int argc, char **argv)
 	check(features(&flags, INSTANCE) == 0, "6. gone from the list");
 
 	char phone[32];
-	int status = -1, secs;
+	int status = -1, secs, away;
 
 	check(add(INSTANCE, FLAG_SONIC_OWN_ADDR, 31, 0, a1) == 0, "7. added again: C0:FF:EE:00:00:01");
 	sleep(3);
@@ -292,6 +299,13 @@ int main(int argc, char **argv)
 	}
 	check(status == 0, "7. power on: added again, as ioslink does");
 	check(features(&flags, INSTANCE) == 1, "7. power on: listed");
+	usleep(500000);	/* the standard set back on air first */
+	connected(phone, sizeof(phone));
+	away = !phone[0];
+	check(add(INSTANCE, FLAG_SONIC_OWN_ADDR, 31, 0, a2) == 0,
+	      "7. updated in place before the iPhone is back: C0:FF:EE:00:00:02");
+	printf("own-adv-check: the iPhone was %s just before the update\n",
+	       away ? "away" : "already back, so btmon decides");
 
 	secs = until_connected(120, phone, sizeof(phone));
 	printf("own-adv-check: the iPhone %s\n", secs < 0 ? "didn't come back in 120 s" : "is connected");
@@ -304,8 +318,8 @@ int main(int argc, char **argv)
 		fflush(stdout);
 		system(cmd);
 		sleep(4);	/* ioslink's connectable advertisement goes on air meanwhile */
-		check(add(INSTANCE, FLAG_SONIC_OWN_ADDR, 31, 0, a2) == 0,
-		      "8. updated in place beside the standard set: C0:FF:EE:00:00:02");
+		check(add(INSTANCE, FLAG_SONIC_OWN_ADDR, 31, 0, a1) == 0,
+		      "8. updated in place after the drop: C0:FF:EE:00:00:01");
 		secs = until_connected(180, phone, sizeof(phone));
 		printf("own-adv-check: the iPhone back after %d s\n", secs < 0 ? -1 : secs + 4);
 		check(secs >= 0, "8. the iPhone reconnected by itself");
