@@ -1121,9 +1121,13 @@ static u8 create_instance_adv_data(struct hci_dev *hdev, u8 instance, u8 *ptr)
 			flags |= mgmt_get_adv_discov_flags(hdev);
 
 		/* If flags would still be empty, then there is no need to
-		 * include the "Flags" AD field".
+		 * include the "Flags" AD field". Nor when the instance's own
+		 * data leaves no room for it: the field would be written past
+		 * the 31-byte buffer (data added before BR/EDR was switched
+		 * off, say). tlv_data_is_valid() refuses such data otherwise.
 		 */
-		if (flags) {
+		if (flags && (!adv_instance ||
+			      adv_instance->adv_data_len <= HCI_MAX_AD_LENGTH - 3)) {
 			ptr[0] = 0x02;
 			ptr[1] = EIR_FLAGS;
 			ptr[2] = flags;
@@ -1141,9 +1145,12 @@ skip_flags:
 		ptr += adv_instance->adv_data_len;
 	}
 
-	/* Provide Tx Power only if we can provide a valid value for it */
+	/* Provide Tx Power only if we can provide a valid value for it,
+	 * and only if it fits.
+	 */
 	if (hdev->adv_tx_power != HCI_TX_POWER_INVALID &&
-	    (instance_flags & MGMT_ADV_FLAG_TX_POWER)) {
+	    (instance_flags & MGMT_ADV_FLAG_TX_POWER) &&
+	    ad_len <= HCI_MAX_AD_LENGTH - 3) {
 		ptr[0] = 0x02;
 		ptr[1] = EIR_TX_POWER;
 		ptr[2] = (u8)hdev->adv_tx_power;

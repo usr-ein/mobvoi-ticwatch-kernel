@@ -6075,6 +6075,17 @@ static bool tlv_data_is_valid(struct hci_dev *hdev, u32 adv_flags, u8 *data,
 
 	max_len = tlv_data_max_len(hdev, adv_flags, is_adv_data);
 
+	/* With BR/EDR off, create_instance_adv_data() adds a 3-byte Flags
+	 * field (LE_AD_NO_BREDR) to advertising data that has none, even when
+	 * no flag asked for managed flags. Keep room for it: otherwise 29 to
+	 * 31 bytes of such data pass here and are written past the 31-byte
+	 * buffer once the instance is scheduled.
+	 */
+	if (is_adv_data && !flags_managed(adv_flags) &&
+	    !hci_dev_test_flag(hdev, HCI_BREDR_ENABLED) &&
+	    !eir_get_data(data, len, EIR_FLAGS, NULL))
+		max_len -= 3;
+
 	if (len > max_len)
 		return false;
 
