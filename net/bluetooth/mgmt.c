@@ -992,6 +992,8 @@ static void cancel_adv_timeout(struct hci_dev *hdev)
 	}
 }
 
+static bool sonic_adv_is(struct hci_dev *hdev, u8 instance);
+
 static int clean_up_hci_state(struct hci_dev *hdev)
 {
 	struct hci_request req;
@@ -1018,6 +1020,15 @@ static int clean_up_hci_state(struct hci_dev *hdev)
 		/* 0x15 == Terminated due to Power Off */
 		__hci_abort_conn(&req, conn, 0x15);
 	}
+
+	/* P-049: the vendor set too, and last, so that a refusal can't keep the
+	 * commands above from going (it ends the request). A power off resets
+	 * nothing on this watch: hci0 is bluebinder's vhci, with no
+	 * HCI_QUIRK_RESET_ON_CLOSE and no shutdown, so the set would stay on
+	 * air. __mgmt_power_off() then forgets it.
+	 */
+	if (sonic_adv_is(hdev, 0))
+		__hci_req_sonic_adv(&req, false, NULL, NULL, 0);
 
 	err = hci_req_run(&req, clean_up_hci_complete);
 	if (!err && discov_stopped)
@@ -5977,7 +5988,7 @@ static bool sonic_adv_is(struct hci_dev *hdev, u8 instance)
 }
 
 /* Forget the vendor set's advertisement and say so; with req, also switch the
- * set off (without, at power off, the controller's reset does).
+ * set off. Without, at power off, clean_up_hci_state() has switched it off.
  */
 static void sonic_adv_clear(struct hci_dev *hdev, struct sock *sk,
 			    struct hci_request *req)
@@ -6880,7 +6891,11 @@ void __mgmt_power_off(struct hci_dev *hdev)
 
 	mgmt_pending_foreach(0, hdev, cmd_complete_rsp, &status);
 
-	/* P-049: the reset turned the vendor set off; BlueZ adds it again. */
+	/* P-049: clean_up_hci_state() switched the vendor set off; forget it,
+	 * with Advertising Removed. BlueZ 5.79 doesn't add it again: its user,
+	 * ioslink, takes it back at power off and registers it again at power on
+	 * (sonic-screwdriver ioslink/haystack.go, poweredChanged).
+	 */
 	sonic_adv_clear(hdev, NULL, NULL);
 
 	if (memcmp(hdev->dev_class, zero_cod, sizeof(zero_cod)) != 0) {
