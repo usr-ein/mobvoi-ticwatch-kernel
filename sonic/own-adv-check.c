@@ -8,7 +8,7 @@
  *     '. /opt/asteroid-sdk/environment-setup-armv7vehf-neon-oe-linux-gnueabi; $CC -O2 -o /t/own-adv-check /t/sonic/own-adv-check.c'
  *     (with the SDK volume mounted as for bluetoothd: -v sonic-asteroid-sdk-2.1:/opt/asteroid-sdk:ro)
  *   scp "$T/own-adv-check" sonic-screwdriver:/tmp/
- *   ssh sonic-screwdriver 'systemd-run --unit=own-adv-btmon --collect timeout 60 btmon -w /tmp/own-adv.btsnoop;
+ *   ssh sonic-screwdriver 'systemd-run --unit=own-adv-btmon --collect timeout 300 btmon -w /tmp/own-adv.btsnoop;
  *     systemd-run --unit=own-adv-check --collect /tmp/own-adv-check "#27-1234567" 20'
  *   ssh sonic-screwdriver 'journalctl -u own-adv-check -o short-precise --no-pager;
  *     btmon -r /tmp/own-adv.btsnoop | grep -A4 "0x3f|0x0154"; rm -f /tmp/own-adv-check /tmp/own-adv.btsnoop'
@@ -26,6 +26,17 @@
  *   5. Held for the seconds given (the vendor set advertises meanwhile),
  *      then added again under 5 with C0:FF:EE:00:00:02: updated in place.
  *   6. Removed; gone from the list.
+ * Then the review's two cases (fork PR #12, r1), with bluetoothctl:
+ *   7. Power off with the set on: the kernel switches it off (btmon: the
+ *      0xfd54 disable, answered 0x00, before hci0 closes), forgets it and
+ *      says so (Advertising Removed); after power on it's added again, as
+ *      ioslink does (haystack.go, poweredChanged).
+ *   8. With the set on, the iPhone's link dropped from the watch: ioslink's
+ *      connectable advertisement goes on air on the standard set beside the
+ *      vendor set, the vendor set is updated in place meanwhile (lost mode's
+ *      order), and the iPhone comes back by itself (Sonic's pending connect).
+ *      Then the set is removed. btmon and ioslink's journal show the rest.
+ * The iPhone's address is never printed.
  */
 #include <errno.h>
 #include <poll.h>
@@ -46,6 +57,7 @@
 #define OP_REMOVE_ADVERTISING 0x003f
 #define EV_CMD_COMPLETE 0x0001
 #define EV_CMD_STATUS 0x0002
+#define EV_ADV_REMOVED 0x0024
 #define FLAG_SONIC_OWN_ADDR (1u << 31)
 #define INSTANCE 5
 
@@ -163,6 +175,58 @@ static int removal(int instance)
 	return command(OP_REMOVE_ADVERTISING, p, 1, NULL, NULL);
 }
 
+/* Waits up to seconds for an event of type ev about hci0 whose first byte is instance. */
+static int wait_event(uint16_t ev, int instance, int seconds)
+{
+	uint8_t buf[512];
+
+	for (int i = 0; i < seconds * 2; i++) {
+		struct pollfd pfd = { .fd = sk, .events = POLLIN };
+		ssize_t n;
+
+		if (poll(&pfd, 1, 500) != 1)
+			continue;
+		n = read(sk, buf, sizeof(buf));
+		if (n >= 7 && get16(buf) == ev && get16(buf + 2) == 0 && buf[6] == instance)
+			return 1;
+	}
+	return 0;
+}
+
+/* The connected device's address, from bluetoothctl, or "" for none: the iPhone's. */
+static void connected(char *out, size_t size)
+{
+	char line[256];
+	FILE *f = popen("bluetoothctl devices Connected 2>/dev/null", "r");
+
+	out[0] = 0;
+	if (!f)
+		return;
+	while (fgets(line, sizeof(line), f))
+		if (!strncmp(line, "Device ", 7) && strlen(line) >= 24 && !out[0])
+			snprintf(out, size, "%.17s", line + 7);
+	pclose(f);
+}
+
+/* Seconds until a device is connected, up to limit; -1 if none comes. */
+static int until_connected(int limit, char *addr, size_t size)
+{
+	for (int s = 0; s <= limit; s++) {
+		connected(addr, size);
+		if (addr[0])
+			return s;
+		sleep(1);
+	}
+	return -1;
+}
+
+static int run(const char *command)
+{
+	printf("own-adv-check: %s\n", command);
+	fflush(stdout);
+	return system(command);
+}
+
 int main(int argc, char **argv)
 {
 	static const uint8_t a1[6] = { 0xc0, 0xff, 0xee, 0x00, 0x00, 0x01 };
@@ -210,6 +274,43 @@ int main(int argc, char **argv)
 
 	check(removal(INSTANCE) == 0, "6. removed");
 	check(features(&flags, INSTANCE) == 0, "6. gone from the list");
+
+	char phone[32];
+	int status = -1, secs;
+
+	check(add(INSTANCE, FLAG_SONIC_OWN_ADDR, 31, 0, a1) == 0, "7. added again: C0:FF:EE:00:00:01");
+	sleep(3);
+	run("bluetoothctl power off");
+	check(wait_event(EV_ADV_REMOVED, INSTANCE, 10), "7. power off: Advertising Removed");
+	check(features(&flags, INSTANCE) == 0, "7. power off: gone from the list");
+	sleep(3);
+	run("bluetoothctl power on");
+	for (int i = 0; i < 40 && status != 0; i++) {
+		status = add(INSTANCE, FLAG_SONIC_OWN_ADDR, 31, 0, a1);
+		if (status)
+			usleep(500000);
+	}
+	check(status == 0, "7. power on: added again, as ioslink does");
+	check(features(&flags, INSTANCE) == 1, "7. power on: listed");
+
+	secs = until_connected(120, phone, sizeof(phone));
+	printf("own-adv-check: the iPhone %s\n", secs < 0 ? "didn't come back in 120 s" : "is connected");
+	check(secs >= 0, "8. the iPhone is connected, before the drop");
+	if (secs >= 0) {
+		char cmd[96];
+
+		snprintf(cmd, sizeof(cmd), "bluetoothctl disconnect %s >/dev/null", phone);
+		printf("own-adv-check: dropping the iPhone's link\n");
+		fflush(stdout);
+		system(cmd);
+		sleep(4);	/* ioslink's connectable advertisement goes on air meanwhile */
+		check(add(INSTANCE, FLAG_SONIC_OWN_ADDR, 31, 0, a2) == 0,
+		      "8. updated in place beside the standard set: C0:FF:EE:00:00:02");
+		secs = until_connected(180, phone, sizeof(phone));
+		printf("own-adv-check: the iPhone back after %d s\n", secs < 0 ? -1 : secs + 4);
+		check(secs >= 0, "8. the iPhone reconnected by itself");
+	}
+	check(removal(INSTANCE) == 0, "8. removed");
 
 	printf("own-adv-check: RESULT: %s\n", fails ? "FAIL" : "PASS");
 	return fails ? 1 : 0;
