@@ -15,15 +15,20 @@ its update. Whether the case passed is the capture's to say, by this criterion:
   - 0x55 for handle 0 follows that connection: the standard set, ended by it.
 
   sonic/own-adv-verdict.py CAPTURE.btsnoop
+  sonic/own-adv-verdict.py --self-test
 
 Prints each disable the capture holds and what became of it, then one of
 PASS (a disable meets every point), NOT CAPTURED (none was made with the
-standard set alone on air), or FAIL (a vendor command was refused). Reads
-btmon's own format (btsnoop, datalink 2001). Prints no address.
+standard set alone on air), INCONCLUSIVE (one was, but the capture can't
+settle it), or FAIL (a vendor command refused, or never answered). Reads
+btmon's own format (btsnoop, datalink 2001). Prints no address. --self-test
+reads synthetic captures with a known verdict each.
 """
 
+import os
 import struct
 import sys
+import tempfile
 from datetime import UTC, datetime
 
 BTSNOOP_EPOCH_DELTA = 0x00DCDDB30F2F8000  # µs from year 0 to 1970
@@ -75,11 +80,15 @@ def verdict(path):
             events.append((when, "connected", 0))  # LE (Enhanced) Connection Complete
         elif code == 0xFF and len(data) > 3 and data[2] == 0x55:
             events.append((when, "0x55", data[3]))  # the set it reports
-    refused = [
-        i for i, c in enumerate(cmds) if c[1] == VENDOR_MULTI_ADV and answers.get(i, 0)
-    ]
-    if refused:
-        return [], f"FAIL: {len(refused)} vendor commands refused"
+    # Every vendor command answered 0x00: one never answered fails too.
+    vendor = [i for i, c in enumerate(cmds) if c[1] == VENDOR_MULTI_ADV]
+    refused = [i for i in vendor if i in answers and answers[i] != 0]
+    unanswered = [i for i in vendor if i not in answers]
+    if refused or unanswered:
+        return [], (
+            f"FAIL: of {len(vendor)} vendor commands, "
+            f"{len(refused)} refused, {len(unanswered)} never answered"
+        )
 
     lines, passed = [], False
     standard_on = False
@@ -131,7 +140,70 @@ def verdict(path):
     return lines, "NOT CAPTURED"
 
 
+def synthetic(path, steps):
+    """A btmon capture of `steps`: ("cmd", opcode, params), ("cc", opcode, status),
+    ("connected",) or ("0x55", set), 10 ms apart."""
+    with open(path, "wb") as f:
+        f.write(b"btsnoop\0" + struct.pack(">II", 1, 2001))
+        stamp = BTSNOOP_EPOCH_DELTA + 1_794_000_000_000_000
+        for step in steps:
+            if step[0] == "cmd":
+                kind, data = (
+                    COMMAND,
+                    struct.pack("<HB", step[1], len(step[2])) + step[2],
+                )
+            elif step[0] == "cc":
+                kind, data = (
+                    EVENT,
+                    bytes([0x0E, 4, 1]) + struct.pack("<HB", step[1], step[2]),
+                )
+            elif step[0] == "connected":
+                kind, data = EVENT, bytes([0x3E, 19, 0x01, 0x00]) + bytes(17)
+            else:
+                kind, data = EVENT, bytes([0xFF, 5, 0x55, step[1], 0x00, 0x40, 0x00])
+            f.write(struct.pack(">IIIIq", len(data), len(data), kind, 0, stamp) + data)
+            stamp += 10_000
+
+
+def self_test():
+    """Synthetic captures, each with the verdict it must get."""
+    enable = [("cmd", LE_SET_ADV_ENABLE, b"\x01"), ("cc", LE_SET_ADV_ENABLE, 0)]
+    disable = ("cmd", VENDOR_MULTI_ADV, b"\x05\x00\x01")
+    back = [("connected",), ("0x55", 0)]
+    cases = {
+        "the case, passed": (
+            enable + [disable, ("cc", VENDOR_MULTI_ADV, 0)] + back,
+            "PASS",
+        ),
+        "the disable refused": (
+            enable + [disable, ("cc", VENDOR_MULTI_ADV, 0x0C)] + back,
+            "FAIL",
+        ),
+        "the disable never answered": (enable + [disable] + back, "FAIL"),
+        "the standard set started again": (
+            enable + [disable, ("cc", VENDOR_MULTI_ADV, 0)] + enable + back,
+            "INCONCLUSIVE",
+        ),
+        "a link up at the disable": (
+            enable + [("connected",), disable, ("cc", VENDOR_MULTI_ADV, 0)],
+            "NOT CAPTURED",
+        ),
+    }
+    failed = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, (steps, want) in cases.items():
+            path = os.path.join(tmp, "capture.btsnoop")
+            synthetic(path, steps)
+            got = verdict(path)[1]
+            ok = got.split(":")[0] == want
+            failed += not ok
+            print(f"{'ok  ' if ok else 'FAIL'} {name}: {got}")
+    sys.exit(1 if failed else 0)
+
+
 def main():
+    if sys.argv[1:] == ["--self-test"]:
+        self_test()
     if len(sys.argv) != 2:
         sys.exit(__doc__)
     lines, result = verdict(sys.argv[1])
