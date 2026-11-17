@@ -459,7 +459,11 @@ Done four times, each time with the user's explicit OK:
     Between 21:33:00.676 and 21:38:40.950 the only HCI traffic is the
     removal's `05 00 01` and its answer: the standard set stayed on air
     after the vendor set was switched off, with nothing to restart it. Its
-    RESULT read FAIL only because the iPhone came back after its 120 s.
+    RESULT read FAIL only because the iPhone came back after its 120 s: the
+    user's Bluetooth stayed off until about 21:38, hence the 5 min 40 s.
+    `sonic/own-adv-verdict.py` reads both captures to the same verdict: PASS
+    for 21:32 (step 7's update and the final removal; steps 5 and 6 spoiled
+    by step 7's power off), NOT CAPTURED for 21:12.
   - The rollback, had it failed: 025's `boot-final.img` (6cc98f14…, kept on
     the Mac) written to `boot` by step 2; the 2.1 release already in
     `recovery`.

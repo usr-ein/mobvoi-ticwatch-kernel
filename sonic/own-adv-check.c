@@ -36,7 +36,8 @@
  *      case fork PR #12's round 2 asked for (its note 2), the vendor set
  *      switched off while only the standard set advertises, as at a key
  *      change while the iPhone is away. The check says on a line of its own
- *      whether it captured it; btmon decides whether it passed:
+ *      whether it captured it; btmon's capture decides whether it passed
+ *      (sonic/own-adv-verdict.py reads it, offline):
  *        - the standard set's LE Set Advertising Enable, answered 0x00, comes
  *          before the vendor set's 05 00 01;
  *        - every vendor command is answered 0x00;
